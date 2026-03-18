@@ -34,15 +34,9 @@ KERNEL_SRC=/path/to/linux-kernel
 cp generate_ninja.py $KERNEL_SRC/scripts/
 cp generate_cmdfiles.py $KERNEL_SRC/scripts/
 
-# Copy vmlinux linker scripts
-cp link-vmlinux-ninja.py $KERNEL_SRC/scripts/
-cp link_vmlinux_ninja.py $KERNEL_SRC/scripts/
-
 # Make scripts executable
 chmod +x $KERNEL_SRC/scripts/generate_ninja.py
 chmod +x $KERNEL_SRC/scripts/generate_cmdfiles.py
-chmod +x $KERNEL_SRC/scripts/link-vmlinux-ninja.py
-chmod +x $KERNEL_SRC/scripts/link_vmlinux_ninja.py
 ```
 
 ### Step 2: Modify Top-Level Makefile
@@ -385,8 +379,6 @@ Files added to kernel tree:
 |------|---------|
 | `scripts/generate_ninja.py` | Main ninja build file generator |
 | `scripts/generate_cmdfiles.py` | Generates .cmd files without compiling |
-| `scripts/link-vmlinux-ninja.py` | Python implementation of vmlinux linker |
-| `scripts/link_vmlinux_ninja.py` | Wrapper script for vmlinux linking |
 
 Files modified:
 
@@ -408,18 +400,6 @@ If `make ninja` fails with "No .cmd files found":
 # Ensure cmdfiles ran successfully
 make cmdfiles V=1
 # Check for errors in specific directories
-```
-
-### Vmlinux Link Failures
-
-If vmlinux linking fails:
-
-```bash
-# Use the standalone linker script
-python3 scripts/link-vmlinux-ninja.py \
-    --vmlinux-a vmlinux.a \
-    --output vmlinux \
-    --verbose
 ```
 
 ### Regenerating build.ninja
@@ -456,8 +436,6 @@ To remove the integration:
 # Remove added scripts
 rm -f scripts/generate_ninja.py
 rm -f scripts/generate_cmdfiles.py
-rm -f scripts/link-vmlinux-ninja.py
-rm -f scripts/link_vmlinux_ninja.py
 
 # Revert Makefile changes (manual or use git)
 git checkout Makefile
