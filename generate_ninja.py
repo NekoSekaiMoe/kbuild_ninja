@@ -266,6 +266,9 @@ class NinjaFileGenerator:
 
         # Additional artifacts
         self.special_objs = {}    # special object files like .vmlinux.export.o
+        
+        # Generated source files (perlasm, pnmtologo, etc.)
+        self.generated_sources = {}  # output -> (generator_type, input, extra_args)
 
     def collect_cmdfiles(self, paths):
         """Collect and parse all .cmd files from given paths."""
@@ -315,32 +318,80 @@ class NinjaFileGenerator:
                         self.archive_rules[target] = objs
 
     def _parse_ar_command(self, command, archive):
-        """Parse ar command to extract object dependencies."""
-        # Find objects after the archive name
-        parts = command.split()
+        """Parse ar command to extract object dependencies.
+        
+        Handles both standard ar commands and printf/xargs format:
+        - Standard: ar cDPrST archive.a obj1.o obj2.o
+        - Printf/xargs: printf "dir/%s " obj1.o obj2.o | xargs ar cDPrST archive.a
+        """
         objs = []
-        found_archive = False
-        archive_basename = os.path.basename(archive)
         archive_dir = os.path.dirname(archive)
         
+        # Check for printf/xargs format
+        if 'printf' in command and 'xargs' in command:
+            # Extract format string and object list
+            # Format: printf "dir/%s " obj1.o obj2.o ... | xargs ar cDPrST archive.a
+            import re
+
+            # Find the printf format string (e.g., "arch/arm64/kernel/%s ")
+            # Use word boundary to avoid matching 'printf' in variable names like 'savedcmd_lib/built-in.a'
+            format_match = re.search(r'\bprintf\s+"([^"]+)"', command)
+            if format_match:
+                format_str = format_match.group(1)
+
+                # Extract all object names after the format string (before | or xargs)
+                # Objects are .o or .a files
+                obj_pattern = r'(\S+\.(?:o|a))'
+
+                # Find the part after printf "..." and before | or xargs
+                # Use word boundary \b to match 'printf' as a command, not part of variable name
+                parts_section = re.split(r'\bprintf', command)[-1].split('|')[0]
+                # Remove the format string itself
+                parts_section = re.sub(r'"[^"]+"', '', parts_section, count=1)
+
+                # Find all object files
+                for match in re.finditer(obj_pattern, parts_section):
+                    obj_name = match.group(1)
+                    # Apply format string
+                    if '%s' in format_str:
+                        obj_path = format_str.replace('%s', obj_name)
+                    else:
+                        obj_path = obj_name
+
+                    # Strip whitespace from path
+                    obj_path = obj_path.strip()
+
+                    # Normalize path
+                    obj_path = normalize_path(obj_path)
+                    if archive_dir and not obj_path.startswith(archive_dir + '/'):
+                        obj_path = os.path.join(archive_dir, obj_path)
+                    obj_path = normalize_path(obj_path)
+                    objs.append(obj_path)
+                return objs
+        
+        # Standard ar command parsing
+        parts = command.split()
+        found_archive = False
+        archive_basename = os.path.basename(archive)
+        
         for part in parts:
-            # Normalize the part
             part = normalize_path(part)
             
             if part == archive or part == archive_basename:
                 found_archive = True
                 continue
             if found_archive and (part.endswith('.o') or part.endswith('.a')):
-                # Convert to full path relative to archive directory
-                # Handle paths that might be relative or have double slashes
                 if os.path.isabs(part):
                     obj_path = part
                 elif archive_dir and archive_dir != '.':
-                    # Prepend archive directory to relative paths
-                    obj_path = os.path.join(archive_dir, part)
+                    if part.startswith(archive_dir + '/'):
+                        obj_path = part
+                    else:
+                        obj_path = os.path.join(archive_dir, part)
                 else:
                     obj_path = part
-                objs.append(normalize_path(obj_path))
+                obj_path = normalize_path(obj_path)
+                objs.append(obj_path)
         return objs
 
     def collect_vmlinux_deps(self):
@@ -353,14 +404,19 @@ class NinjaFileGenerator:
                 # Parse the ar command to get the list of built-in.a files
                 deps = self._parse_ar_command(command, target)
                 # Filter out built-in.a files for vmlinux.a deps
-                self.vmlinux_a_deps = [d for d in deps if d.endswith('built-in.a')]
+                self.vmlinux_a_deps = [d.lstrip('./') for d in deps if d.endswith('built-in.a')]
                 # lib.a files go to vmlinux_libs
-                self.vmlinux_libs = [d for d in deps if d.endswith('lib.a')]
-        
+                self.vmlinux_libs = [d.lstrip('./') for d in deps if d.endswith('lib.a')]
+
         # Also check for existing vmlinux.a
         vmlinux_a = os.path.join(self.directory, 'vmlinux.a')
         if os.path.exists(vmlinux_a) and not self.vmlinux_a_deps:
-            self.vmlinux_a_deps = parse_archive_for_objs(vmlinux_a, self.ar)
+            self.vmlinux_a_deps = [d.lstrip('./') for d in parse_archive_for_objs(vmlinux_a, self.ar) if d.endswith('built-in.a')]
+
+        # Collect all lib.a files for KBUILD_VMLINUX_LIBS
+        # These are libraries that need to be linked with vmlinux
+        if not self.vmlinux_libs:
+            self.vmlinux_libs = self._find_lib_a_files()
 
         # Check for special objects
         export_o = os.path.join(self.directory, '.vmlinux.export.o')
@@ -381,14 +437,58 @@ class NinjaFileGenerator:
         with open(self.output, 'w', encoding='utf-8') as f:
             self._synthesize_missing_objcopy_rules()
             self._synthesize_missing_dtb_rules()
+            self._find_all_generated_sources()  # Find generated sources before writing rules
             self._write_header(f)
             self._write_rules(f)
+            self._write_generated_source_rules(f)
             self._write_compile_rules(f)
             self._write_objcopy_rules(f)
             self._write_archive_rules(f)
+            self._write_header_rules(f)
             self._write_vmlinux_rules(f)
             self._write_modules_rules(f)
             self._write_default_target(f)
+
+    def _write_generated_source_rules(self, f):
+        """Write rules for generated source files (perlasm, pnmtologo, etc.)."""
+        if not self.generated_sources:
+            return
+        
+        f.write('# Generated source file rules\n')
+        
+        # Track if we need pnmtologo host program
+        needs_pnmtologo = any(
+            gen_type == 'pnmtologo' 
+            for output, (gen_type, input_file, extra) in self.generated_sources.items()
+        )
+        
+        # Build pnmtologo host program if needed
+        if needs_pnmtologo:
+            f.write('# Host program: pnmtologo\n')
+            f.write('build drivers/video/logo/pnmtologo: hostcc drivers/video/logo/pnmtologo.c\n\n')
+        
+        for output, (gen_type, input_file, extra) in self.generated_sources.items():
+            escaped_output = escape_ninja_path(output)
+            escaped_input = escape_ninja_path(input_file)
+            
+            if gen_type == 'perlasm':
+                # Perl generates .S from .pl
+                # For sha2-armv8.pl, the script uses output filename to determine
+                # whether to generate sha256 or sha512 code
+                # Command: perl script.pl void output.S
+                f.write(f'build {escaped_output}: perlasm_args {escaped_input}\n\n')
+            
+            elif gen_type == 'pnmtologo':
+                # pnmtologo generates .c from .ppm/.pbm
+                # Depends on the compiled pnmtologo host program
+                logo_type = extra.get('type', 'clut224')
+                logo_name = extra.get('name', 'logo')
+                script = 'drivers/video/logo/pnmtologo'
+                # Add implicit dependency on pnmtologo host program
+                f.write(f'build {escaped_output}: pnmtologo {escaped_input} | {script}\n')
+                f.write(f'  script = {script}\n')
+                f.write(f'  type = {logo_type}\n')
+                f.write(f'  name = {logo_name}\n\n')
 
     def _synthesize_missing_objcopy_rules(self):
         """Synthesize objcopy rules for .pi.o files missing .cmd files."""
@@ -464,31 +564,163 @@ class NinjaFileGenerator:
                         # Generated source files - remove from deps
                         self.archive_rules[archive].remove(obj)
                     else:
-                        # Unknown - try to find source file
-                        obj_dir = os.path.dirname(obj)
-                        obj_name = os.path.basename(obj).replace('.o', '')
-                        # Try .c, .S in same directory
-                        # Use '../' prefix only when building out-of-tree (directory != '.')
-                        prefix = '../' if self.directory != '.' else ''
-                        for ext in ['.c', '.S']:
-                            src_path = os.path.join(prefix, obj_dir, obj_name + ext) if prefix else os.path.join(obj_dir, obj_name + ext)
-                            if os.path.exists(src_path):
-                                # Found source, synthesize a simple compile rule
-                                # Use existing compile rule as template if available
-                                if self.compile_rules:
-                                    sample_target = next(iter(self.compile_rules.keys()))
-                                    _, sample_cmd = self.compile_rules[sample_target]
-                                    # Replace the sample paths with our paths
-                                    synthesized_cmd = sample_cmd.replace(sample_target, obj)
-                                    synthesized_cmd = re.sub(r'\S+\.c$', src_path, synthesized_cmd)
-                                    self.compile_rules[obj] = (src_path, synthesized_cmd)
-                                break
+                        # Unknown - try to find source file or generator
+                        self._try_find_generator(obj, archive)
+
+    def _try_find_generator(self, obj, archive):
+        """Try to find a generator for a missing object file."""
+        obj_dir = os.path.dirname(obj)
+        obj_name = os.path.basename(obj).replace('.o', '')
+        
+        # Check for perlasm-generated .S files (crypto)
+        # Pattern: dir/name-core.S generated from dir/name-armv8.pl or dir/name.pl
+        # Special case: sha256-core and sha512-core both come from sha2-armv8.pl
+        possible_pl_files = [
+            os.path.join(obj_dir, obj_name + '-armv8.pl'),
+            os.path.join(obj_dir, obj_name + '-armv4.pl'),
+            os.path.join(obj_dir, obj_name + '.pl'),
+            # Special case: sha256-core and sha512-core from sha2-armv8.pl
+            os.path.join(obj_dir, 'sha2-armv8.pl'),
+        ]
+        for pl_file in possible_pl_files:
+            if os.path.exists(pl_file):
+                # Found a perl generator
+                s_file = obj.replace('.o', '.S')
+                self.generated_sources[s_file] = ('perlasm', pl_file, obj_name)
+                # Now synthesize compile rule for .S -> .o
+                self._synthesize_as_compile_rule(obj, s_file)
+                return
+        
+        # Check for pnmtologo-generated .c files (logo)
+        # Pattern: drivers/video/logo/logo_*.c from logo_*.ppm or logo_*.pbm
+        if 'logo' in obj_dir and obj_name.startswith('logo_'):
+            # Determine logo type from name
+            if 'mono' in obj_name:
+                logo_type = 'mono'
+                ext = '.pbm'
+            elif 'vga16' in obj_name:
+                logo_type = 'vga16'
+                ext = '.ppm'
+            else:
+                logo_type = 'clut224'
+                ext = '.ppm'
+            
+            src_file = os.path.join(obj_dir, obj_name + ext)
+            if os.path.exists(src_file):
+                c_file = obj.replace('.o', '.c')
+                self.generated_sources[c_file] = ('pnmtologo', src_file, {'type': logo_type, 'name': obj_name})
+                self._synthesize_c_compile_rule(obj, c_file)
+                return
+        
+        # Check for .asn1 generated files
+        if '.asn1' in obj_name:
+            # ASN.1 files are generated during build - they need special handling
+            # For now, mark them as needing fallback
+            return
+        
+        # Try to find source file
+        for ext in ['.c', '.S']:
+            src_path = os.path.join(obj_dir, obj_name + ext)
+            if os.path.exists(src_path):
+                if ext == '.S':
+                    self._synthesize_as_compile_rule(obj, src_path)
+                else:
+                    self._synthesize_c_compile_rule(obj, src_path)
+                return
+    
+    def _synthesize_as_compile_rule(self, obj, s_file):
+        """Synthesize an assembly compile rule."""
+        if self.compile_rules:
+            # Find an existing .S compile rule as template
+            for sample_target, (sample_src, sample_cmd) in self.compile_rules.items():
+                if sample_src and sample_src.endswith('.S'):
+                    synthesized_cmd = sample_cmd.replace(sample_target, obj)
+                    synthesized_cmd = re.sub(r'\S+\.S$', s_file, synthesized_cmd)
+                    self.compile_rules[obj] = (s_file, synthesized_cmd)
+                    return
+        # Fallback: create a simple rule
+        self.compile_rules[obj] = (s_file, f'gcc -c -o {obj} {s_file}')
+    
+    def _synthesize_c_compile_rule(self, obj, c_file):
+        """Synthesize a C compile rule."""
+        if self.compile_rules:
+            # Find an existing .c compile rule as template
+            for sample_target, (sample_src, sample_cmd) in self.compile_rules.items():
+                if sample_src and sample_src.endswith('.c'):
+                    synthesized_cmd = sample_cmd.replace(sample_target, obj)
+                    synthesized_cmd = re.sub(r'\S+\.c$', c_file, synthesized_cmd)
+                    self.compile_rules[obj] = (c_file, synthesized_cmd)
+                    return
+        # Fallback: create a simple rule
+        self.compile_rules[obj] = (c_file, f'gcc -c -o {obj} {c_file}')
+
+    def _try_find_generator_for_source(self, source_path):
+        """Try to find a generator for a source file that doesn't exist yet.
+        
+        This handles cases like:
+        - sha256-core.S from sha2-armv8.pl (perlasm)
+        - logo_linux_clut224.c from logo_linux_clut224.ppm (pnmtologo)
+        """
+        src_dir = os.path.dirname(source_path)
+        src_name = os.path.basename(source_path)
+        src_base, src_ext = os.path.splitext(src_name)
+        
+        # Check for perlasm-generated .S files (crypto)
+        if src_ext == '.S':
+            # Pattern: name-core.S generated from name-armv8.pl or name.pl
+            # Also handle sha2-armv8.pl which generates sha256-core.S and sha512-core.S
+            possible_pl_files = [
+                os.path.join(src_dir, src_base + '-armv8.pl'),
+                os.path.join(src_dir, src_base + '-armv4.pl'),
+                os.path.join(src_dir, src_base + '.pl'),
+                # Special case: sha256-core.S and sha512-core.S both come from sha2-armv8.pl
+                os.path.join(src_dir, 'sha2-armv8.pl'),
+            ]
+            for pl_file in possible_pl_files:
+                if os.path.exists(pl_file):
+                    # Found a perl generator
+                    self.generated_sources[source_path] = ('perlasm', pl_file, src_base)
+                    return
+        
+        # Check for pnmtologo-generated .c files (logo)
+        if src_ext == '.c' and 'logo' in src_dir and src_name.startswith('logo_'):
+            # Determine logo type from name
+            if 'mono' in src_name:
+                logo_type = 'mono'
+                logo_ext = '.pbm'
+            elif 'vga16' in src_name:
+                logo_type = 'vga16'
+                logo_ext = '.ppm'
+            else:
+                logo_type = 'clut224'
+                logo_ext = '.ppm'
+            
+            src_file = os.path.join(src_dir, src_base + logo_ext)
+            if os.path.exists(src_file):
+                self.generated_sources[source_path] = ('pnmtologo', src_file, {'type': logo_type, 'name': src_base})
+
+    def _find_all_generated_sources(self):
+        """Find all source files that need to be generated before compilation.
+        
+        This scans all compile rules to find sources that don't exist
+        and tries to find generators for them.
+        """
+        for obj, (source, _) in self.compile_rules.items():
+            if not source:
+                continue
+            
+            # Remove ../ prefix if present
+            source_path = source[3:] if source.startswith('../') else source
+            
+            if not os.path.exists(source_path):
+                self._try_find_generator_for_source(source_path)
 
     def _write_header(self, f):
         """Write ninja file header."""
         f.write('# Generated by generate_ninja.py\n')
         f.write('# Do not edit manually\n\n')
         f.write(f'builddir = {escape_ninja_path(self.directory)}\n')
+        f.write(f'srctree = {escape_ninja_path(self._find_srctree())}\n')
         f.write(f'AR = {self.ar}\n')
         f.write(f'LD = {self.ld}\n')
         f.write(f'CC = {self.cc}\n\n')
@@ -507,25 +739,51 @@ class NinjaFileGenerator:
         f.write('  command = $cmd\n')
         f.write('  description = AS $out\n\n')
 
-        # Archive rule
+        # Archive rule - use thin archive (T) matching kernel's cDPrsT
+        # Thin archives contain references to original files, enabling nested archive support
         f.write('rule ar\n')
-        f.write('  command = rm -f $out && $AR rcST $out $in\n')
+        f.write('  command = rm -f $out && $AR rcsT $out $in\n')
         f.write('  description = AR $out\n\n')
+
+        # Empty archive rule (creates an empty thin archive)
+        f.write('rule ar_empty\n')
+        f.write('  command = rm -f $out && $AR rcsT $out\n')
+        f.write('  description = AR $out (empty)\n\n')
 
         # Link rule for object files
         f.write('rule ld\n')
         f.write('  command = $cmd\n')
         f.write('  description = LD $out\n\n')
 
-        # Link rule for vmlinux.o
+        # Link rule for vmlinux.o (matching scripts/Makefile.vmlinux_o)
         f.write('rule ld_vmlinux_o\n')
-        f.write('  command = $LD -r -o $out --whole-archive $in --no-whole-archive --start-group $libs --end-group\n')
+        f.write('  command = $LD $KBUILD_LDFLAGS -r -o $out --whole-archive $in --no-whole-archive --start-group $libs --end-group\n')
         f.write('  description = LD $out\n\n')
 
         # Link rule for vmlinux
         f.write('rule ld_vmlinux\n')
         f.write('  command = $cmd\n')
         f.write('  description = LD $out\n\n')
+
+        # Linker script preprocessing rule (.lds.S -> .lds)
+        # Match kernel's standard preprocessing flags
+        f.write('rule lds_preproc\n')
+        f.write('  command = $CC -E -nostdinc -I./arch/arm64/include -I./arch/arm64/include/generated -I./include -I./arch/arm64/include/uapi -I./arch/arm64/include/generated/uapi -I./include/uapi -I./include/generated/uapi -include ./include/linux/compiler-version.h -include ./include/linux/kconfig.h -D__KERNEL__ -mlittle-endian -P -Uarm64 -D__ASSEMBLY__ -DLINKER_SCRIPT -o $out $in\n')
+        f.write('  description = LDS $out\n\n')
+
+        # Header generation rules (pure shell, no Make syntax)
+        f.write('rule gen_utsrelease_h\n')
+        f.write('  command = printf "#define UTS_RELEASE \\"%s\\"\\n" "$$(cat include/config/kernel.release 2>/dev/null || echo unknown)" > $out\n')
+        f.write('  description = GEN $out\n\n')
+
+        f.write('rule gen_compile_h\n')
+        cmd = """  command = sh -c '$srctree/scripts/mkcompile_h "$$(uname -m)" "$$(gcc --version 2>/dev/null | head -1)" "$${LD:-ld}" > $out'\n"""
+        f.write(cmd)
+        f.write('  description = GEN $out\n\n')
+
+        f.write('rule gen_utsversion_h\n')
+        f.write('  command = utsver="$$(cat include/config/kernel.release 2>/dev/null || echo unknown)"; if grep -q "CONFIG_SMP=y" include/config/auto.conf 2>/dev/null; then utsver="$$utsver SMP"; fi; if grep -q "CONFIG_PREEMPT=y" include/config/auto.conf 2>/dev/null; then utsver="$$utsver PREEMPT"; fi; utsver="$$utsver $$(date +%Y-%m-%d)"; utsver=$$(echo "$$utsver" | cut -c1-64); printf "#define UTS_VERSION \\"%s\\"\\n" "$$utsver" > $out\n')
+        f.write('  description = GEN $out\n\n')
 
         # Kallsyms rule
         f.write('rule kallsyms\n')
@@ -546,6 +804,40 @@ class NinjaFileGenerator:
         f.write('rule objcopy\n')
         f.write('  command = $cmd\n')
         f.write('  description = OBJCOPY $out\n\n')
+
+        # Perl ASM generator rule (for crypto .S files generated from .pl)
+        f.write('rule perlasm\n')
+        f.write('  command = perl $in > $out\n')
+        f.write('  description = PERLASM $out\n\n')
+
+        # Perl ASM with args rule (for crypto .S files with extra args)
+        # The script uses output filename to determine what to generate (sha256 vs sha512)
+        # Command: perl script.pl void output.S
+        f.write('rule perlasm_args\n')
+        f.write('  command = perl $in void $out\n')
+        f.write('  description = PERLASM $out\n\n')
+
+        # Host program compilation rule
+        f.write('rule hostcc\n')
+        f.write('  command = gcc -Wall -O2 -o $out $in\n')
+        f.write('  description = HOSTCC $out\n\n')
+
+        # PNM to logo converter rule
+        # pnmtologo is a host program that needs to be compiled first
+        f.write('rule pnmtologo\n')
+        f.write('  command = $script -t $type -n $name -o $out $in\n')
+        f.write('  description = LOGO $out\n\n')
+
+        # Vmlinux final link rule - calls link-vmlinux-ninja.py
+        f.write('rule vmlinux_link\n')
+        f.write('  command = LD=/usr/bin/aarch64-linux-gnu-ld.bfd KBUILD_LDFLAGS="-EL -maarch64elf -z noexecstack --no-warn-rwx-segments" LDFLAGS_vmlinux="-X --pic-veneer -shared -Bsymbolic -z notext --no-apply-dynamic-reloc --build-id=sha1 --orphan-handling=warn" python3 scripts/link-vmlinux-ninja.py --vmlinux-a $vmlinux_a --output $out --objtree . --srctree . --lds $lds --version-timestamp-o $version_ts\n')
+        f.write('  description = LINK vmlinux\n\n')
+
+        # Fallback rule for targets without known rules (complex link targets, etc.)
+        # Uses flock to serialize make calls to avoid race conditions with kernel.release
+        f.write('rule fallback\n')
+        f.write('  command = flock /tmp/linux-ninja.lock -c "make $target"\n')
+        f.write('  description = FALLBACK MAKE $target\n\n')
 
     def _write_compile_rules(self, f):
         """Write compile rules for object files."""
@@ -573,6 +865,9 @@ class NinjaFileGenerator:
         prefix = '../' if out_of_tree else ''
 
         for obj in sorted(self.compile_rules.keys()):
+            # Skip version-timestamp.o as we have a custom rule for it
+            if 'version-timestamp.o' in obj:
+                continue
             source, command = self.compile_rules[obj]
             if not source:
                 continue
@@ -592,7 +887,19 @@ class NinjaFileGenerator:
             else:
                 rule = 'cc'
 
-            f.write(f'build {escaped_obj}: {rule} {escaped_src}\n')
+            # Check if source file is generated (doesn't exist or in generated_sources)
+            source_path = source[3:] if source.startswith('../') else source
+            implicit_deps = []
+            if source_path in self.generated_sources:
+                # Add the generated source as an implicit dependency
+                # This ensures the generator runs before compilation
+                implicit_deps.append(escaped_src)
+
+            # Write build rule with optional implicit dependencies
+            if implicit_deps:
+                f.write(f'build {escaped_obj}: {rule} {escaped_src} | {" ".join(implicit_deps)}\n')
+            else:
+                f.write(f'build {escaped_obj}: {rule} {escaped_src}\n')
             f.write(f'  cmd = {escaped_cmd}\n\n')
 
     def _write_objcopy_rules(self, f):
@@ -611,18 +918,126 @@ class NinjaFileGenerator:
             f.write(f'build {escaped_target}: objcopy {escaped_input}\n')
             f.write(f'  cmd = {escaped_cmd}\n\n')
 
+    def _write_fallback_rule(self, f, target):
+        """Generate a fallback rule that calls make for targets without known rules.
+        
+        This handles complex link targets like kvm_nvhe.o that are generated
+        through multi-step link processes not captured by .cmd files.
+        """
+        escaped_target = escape_ninja_path(target)
+        f.write(f'build {escaped_target}: fallback\n')
+        f.write(f'  target = {target}\n\n')
+
     def _write_archive_rules(self, f):
         """Write archive rules for built-in.a files."""
         f.write('# Archive rules\n')
 
-        for archive in sorted(self.archive_rules.keys()):
-            objs = self.archive_rules[archive]
+        # Track targets that already have fallback rules to avoid duplicates
+        fallback_written = set()
+
+        # Helper to normalize path (remove leading ./)
+        def normalize_path(p):
+            if p.startswith('./'):
+                return p[2:]
+            return p
+
+        # Normalize archive_rules keys
+        normalized_archive_rules = {}
+        for archive, objs in self.archive_rules.items():
+            norm_archive = normalize_path(archive)
+            norm_objs = [normalize_path(obj) for obj in objs]
+            normalized_archive_rules[norm_archive] = norm_objs
+
+        for archive in sorted(normalized_archive_rules.keys()):
+            objs = normalized_archive_rules[archive]
+
+            # Check for missing dependencies and generate fallback rules
+            # Exclude init/version.o - it will be replaced by version-timestamp.o in final link
+            valid_objs = []
+            for obj in sorted(objs):
+                # Skip init/version.o - it will be replaced by version-timestamp.o
+                if obj.endswith('init/version.o'):
+                    continue
+                # Check if this object has a compile rule, objcopy rule, or is another archive
+                if obj in self.compile_rules or obj in self.objcopy_rules:
+                    valid_objs.append(obj)
+                elif obj.endswith('.a'):
+                    # Archive dependency - check if it has its own rule
+                    if obj in normalized_archive_rules:
+                        valid_objs.append(obj)
+                    elif obj not in fallback_written:
+                        # Missing archive - generate fallback rule
+                        self._write_fallback_rule(f, obj)
+                        fallback_written.add(obj)
+                        valid_objs.append(obj)
+                    else:
+                        valid_objs.append(obj)
+                elif obj not in fallback_written:
+                    # Missing rule - generate fallback
+                    self._write_fallback_rule(f, obj)
+                    fallback_written.add(obj)
+                    valid_objs.append(obj)
+                else:
+                    # Already has fallback rule written
+                    valid_objs.append(obj)
 
             escaped_archive = escape_ninja_path(archive)
-            escaped_objs = ' '.join(escape_ninja_path(obj) for obj in sorted(objs)) if objs else ''
 
-            # Write rule even for empty archives - they're still needed as dependencies
-            f.write(f'build {escaped_archive}: ar {escaped_objs}\n\n')
+            if valid_objs:
+                escaped_objs = ' '.join(escape_ninja_path(obj) for obj in valid_objs)
+                f.write(f'build {escaped_archive}: ar {escaped_objs}\n\n')
+            else:
+                # Empty archive - create empty .a file using ar cq
+                f.write(f'build {escaped_archive}: ar_empty\n\n')
+
+    def _write_header_rules(self, f):
+        """Write rules for generated headers and version-timestamp.o."""
+        f.write('# Generated headers and version-timestamp.o rules\n')
+        auto_conf = os.path.join(self.directory, 'include/config/auto.conf')
+        kernel_release = os.path.join(self.directory, 'include/config/kernel.release')
+        if os.path.exists(kernel_release):
+            f.write('build include/generated/utsrelease.h: gen_utsrelease_h include/config/kernel.release\n\n')
+        else:
+            f.write('build include/generated/utsrelease.h: gen_utsrelease_h\n\n')
+        if os.path.exists(auto_conf):
+            f.write('build include/generated/compile.h: gen_compile_h | include/config/auto.conf\n\n')
+            f.write('build include/generated/utsversion.h: gen_utsversion_h | include/config/auto.conf\n\n')
+        else:
+            f.write('build include/generated/compile.h: gen_compile_h\n\n')
+            f.write('build include/generated/utsversion.h: gen_utsversion_h\n\n')
+        # Use relative paths for consistency with header rules
+        version_ts_o = 'init/version-timestamp.o'
+        version_c = 'init/version.c'
+        utsversion_h = 'include/generated/utsversion.h'
+        utsrelease_h = 'include/generated/utsrelease.h'
+        compile_h = 'include/generated/compile.h'
+        # compile.h is normal dependency (before |), utsversion.h and utsrelease_h are order-only (after |)
+        f.write(f'build {version_ts_o}: cc {version_c} {compile_h} | {utsversion_h} {utsrelease_h}\n')
+        # Extract compile command from version.o.cmd and modify for version-timestamp.o
+        version_cmd_file = os.path.join(self.directory, 'init/.version.o.cmd')
+        if os.path.exists(version_cmd_file):
+            with open(version_cmd_file, 'r') as vcf:
+                cmd_line = vcf.readline().strip()
+            # Remove 'savedcmd_init/version.o := ' prefix
+            if ':=' in cmd_line:
+                cmd = cmd_line.split(':= ', 1)[1]
+            else:
+                cmd = cmd_line
+            # Modify output file and includes
+            cmd = cmd.replace('-o init/version.o', '-o init/version-timestamp.o')
+            # Replace utsversion-tmp.h with multiple -include directives
+            cmd = cmd.replace('init/utsversion-tmp.h', 'include/generated/utsversion.h')
+            # Add additional includes before the -D flags
+            cmd = cmd.replace('    -DKBUILD_MODFILE=', ' -include include/generated/utsrelease.h -include include/generated/compile.h    -DKBUILD_MODFILE=')
+            cmd = cmd.replace("'-DKBUILD_MODFILE=\"init/version\"'", "'-DKBUILD_MODFILE=\"init/version-timestamp\"'")
+            cmd = cmd.replace("'-DKBUILD_BASENAME=\"version\"'", "'-DKBUILD_BASENAME=\"version-timestamp\"'")
+            cmd = cmd.replace("'-DKBUILD_MODNAME=\"version\"'", "'-DKBUILD_MODNAME=\"version-timestamp\"'")
+            cmd = cmd.replace('__KBUILD_MODNAME=kmod_version', '__KBUILD_MODNAME=kmod_version_timestamp')
+            cmd = escape_ninja_cmd(cmd)
+        else:
+            # Fallback to simple command if cmd file doesn't exist
+            cmd = f'$CC -c -o {version_ts_o} {version_c} -include {utsversion_h} -include {utsrelease_h} -include {compile_h}'
+        f.write(f'  cmd = {cmd}\n\n')
 
     def _write_vmlinux_rules(self, f):
         """Write rules for vmlinux build chain."""
@@ -631,50 +1046,199 @@ class NinjaFileGenerator:
 
         f.write('# vmlinux build rules\n')
 
-        # vmlinux.a from all built-in.a
+        # vmlinux.a from all built-in.a and lib.a files
         vmlinux_a = os.path.join(self.directory, 'vmlinux.a')
         escaped_vmlinux_a = escape_ninja_path(vmlinux_a)
-        escaped_deps = ' '.join(escape_ninja_path(dep) for dep in sorted(self.vmlinux_a_deps))
+        # Combine built-in.a deps and lib.a files
+        all_vmlinux_deps = sorted(self.vmlinux_a_deps) + sorted(self.vmlinux_libs)
+        escaped_deps = ' '.join(escape_ninja_path(dep) for dep in all_vmlinux_deps)
 
         f.write(f'build {escaped_vmlinux_a}: ar {escaped_deps}\n\n')
 
         # vmlinux.o from vmlinux.a and lib.a files
+        # Note: version-timestamp.o is NOT linked here, it's linked in the final vmlinux step
         vmlinux_o = os.path.join(self.directory, 'vmlinux.o')
         escaped_vmlinux_o = escape_ninja_path(vmlinux_o)
         escaped_libs = ' '.join(escape_ninja_path(lib) for lib in sorted(self.vmlinux_libs))
 
-        f.write(f'build {escaped_vmlinux_o}: ld_vmlinux_o {escaped_vmlinux_a}\n')
-        f.write(f'  libs = {escaped_libs}\n\n')
+        # Add lib.a files as implicit dependencies (after |) so they are built before linking
+        # but are not passed as input to the linker command directly
+        implicit_deps = ''
+        if self.vmlinux_libs:
+            implicit_deps = ' | ' + ' '.join(escape_ninja_path(lib) for lib in sorted(self.vmlinux_libs))
 
-        # vmlinux final link
-        # This requires the linker script and potentially kallsyms
+        f.write(f'build {escaped_vmlinux_o}: ld_vmlinux_o {escaped_vmlinux_a}{implicit_deps}\n')
+        f.write(f'  libs = {escaped_libs}\n')
+        f.write(f'  LD = /usr/bin/aarch64-linux-gnu-ld.bfd\n')
+        f.write(f'  KBUILD_LDFLAGS = -EL -maarch64elf -z noexecstack --no-warn-rwx-segments\n\n')
+
+        # vmlinux final link using link-vmlinux-ninja.py
         vmlinux = os.path.join(self.directory, 'vmlinux')
-
-        # Check for linker script
         lds_file = self._find_linker_script()
+        
+        # Check if linker script needs preprocessing (.lds.S -> .lds)
+        if lds_file and lds_file.endswith('.lds.S'):
+            lds_output = lds_file[:-2]  # Remove .S extension
+            escaped_lds_s = escape_ninja_path(lds_file)
+            escaped_lds = escape_ninja_path(lds_output)
+            f.write(f'build {escaped_lds}: lds_preproc {escaped_lds_s}\n\n')
+            lds_file = lds_output
+        
+        # Normalize path: remove leading ./ but keep absolute paths intact
         if lds_file:
-            f.write(f'# Linker script: {lds_file}\n')
+            if lds_file.startswith('./'):
+                lds_path = lds_file[2:]
+            elif lds_file.startswith('/'):
+                # Absolute path - convert to relative
+                lds_path = os.path.relpath(lds_file, self.directory)
+            else:
+                lds_path = lds_file
+        else:
+            lds_path = 'arch/arm64/kernel/vmlinux.lds'
+        escaped_lds_path = escape_ninja_path(lds_path)
+        version_ts_o = 'init/version-timestamp.o'
+        escaped_version_ts_o = escape_ninja_path(version_ts_o)
+        # Use vmlinux.a (not vmlinux.o) for final link, matching make behavior
+        escaped_vmlinux_a = escape_ninja_path(os.path.join(self.directory, 'vmlinux.a'))
+        # vmlinux link - inputs are vmlinux.a, version-timestamp.o, and linker script
+        lds_dep = f' {escaped_lds_path}' if lds_path else ''
+        f.write(f'build {escape_ninja_path(vmlinux)}: vmlinux_link {escaped_vmlinux_a} {escaped_version_ts_o}{lds_dep}\n')
+        f.write(f'  vmlinux_a = {escaped_vmlinux_a}\n')
+        f.write(f'  version_ts = {escaped_version_ts_o}\n')
+        f.write(f'  lds = {escaped_lds_path}\n\n')
 
-        # Write vmlinux rule using link-vmlinux.sh approach
-        # For simplicity, we call make vmlinux which handles all the complexity
-        f.write(f'build {escape_ninja_path(vmlinux)}: ld_vmlinux {escaped_vmlinux_o}\n')
-        f.write(f'  cmd = cd {self.directory} && make vmlinux\n\n')
+    def _find_srctree(self):
+        """Find the source tree directory."""
+        # For in-tree builds, srctree == objtree
+        # For out-of-tree builds, we need to find the source tree
+        # Check if there's a source symlink or we can detect from .cmd files
+        if hasattr(self, 'compile_rules') and self.compile_rules:
+            for obj, (source, _) in self.compile_rules.items():
+                if source and source.startswith('../'):
+                    # Out-of-tree build, remove the ../ prefix to get srctree-relative path
+                    # The srctree is the parent of objtree
+                    return os.path.dirname(os.path.realpath(self.directory))
+        # Default: in-tree build
+        return self.directory
 
-        # Add init/version-timestamp.o dependency
-        version_o = os.path.join(self.directory, 'init/version-timestamp.o')
-        if os.path.exists(os.path.join(self.directory, 'init')):
-            f.write(f'# Note: init/version-timestamp.o is built by link-vmlinux.sh\n\n')
+    def _find_lib_a_files(self):
+        """Find all lib.a files for KBUILD_VMLINUX_LIBS.
+        
+        These are typically in:
+        - lib/lib.a
+        - arch/<arch>/lib/lib.a
+        """
+        lib_files = []
+        
+        # Check common lib.a locations - look for .cmd files since lib.a may not be built yet
+        common_libs = [
+            'lib/lib.a',
+            f'arch/{self._get_arch()}/lib/lib.a',
+        ]
+        
+        for lib in common_libs:
+            # .cmd file is in the same directory as lib.a, named .lib.a.cmd
+            lib_dir = os.path.dirname(lib)
+            lib_base = os.path.basename(lib)
+            lib_cmd = os.path.join(self.directory, lib_dir, f'.{lib_base}.cmd')
+            if os.path.exists(lib_cmd):
+                lib_files.append(lib)
+        
+        # Also search for any other lib.a files with .cmd files
+        for root, dirs, files in os.walk(self.directory):
+            # Skip excluded directories
+            if any(excl in root for excl in _EXCLUDE_DIRS):
+                continue
+            if '.lib.a.cmd' in files:
+                lib_path = os.path.join(root, 'lib.a')
+                rel_path = os.path.relpath(lib_path, self.directory)
+                if rel_path not in lib_files:
+                    lib_files.append(rel_path)
+        
+        return lib_files
 
-    def _find_linker_script(self):
-        """Find the linker script for the architecture."""
-        # Try common locations
-        arch_dirs = [d for d in os.listdir(self.directory)
-                     if d.startswith('arch/') or os.path.isdir(os.path.join(self.directory, 'arch', d))]
+    def _get_arch(self):
+        """Get the architecture from .config."""
+        config_file = os.path.join(self.directory, '.config')
+        if os.path.exists(config_file):
+            try:
+                with open(config_file, 'r') as f:
+                    for line in f:
+                        if line.startswith('CONFIG_ARCH_DEFCONFIG='):
+                            # Format: CONFIG_ARCH_DEFCONFIG="arch/arm64/defconfig"
+                            val = line.split('=', 1)[1].strip().strip('"')
+                            if '/' in val:
+                                return val.split('/')[1]
+                        elif line.startswith('CONFIG_ARM64='):
+                            return 'arm64'
+                        elif line.startswith('CONFIG_X86_64=') or line.startswith('CONFIG_X86='):
+                            return 'x86'
+                        elif line.startswith('CONFIG_RISCV='):
+                            return 'riscv'
+            except IOError:
+                pass
+        # Try to detect from directory structure
+        for arch in ['arm64', 'x86', 'riscv', 'arm', 'mips', 'powerpc']:
+            if os.path.exists(os.path.join(self.directory, f'arch/{arch}')):
+                return arch
+        return 'arm64'  # Default fallback
 
+    def _check_config(self, option):
+        """Check if a config option is enabled."""
+        config_file = os.path.join(self.directory, 'include', 'config', 'auto.conf')
+        if not os.path.exists(config_file):
+            # Try .config
+            config_file = os.path.join(self.directory, '.config')
+        if not os.path.exists(config_file):
+            return False
+        try:
+            with open(config_file, 'r') as f:
+                for line in f:
+                    if line.strip() == f"{option}=y":
+                        return True
+        except IOError:
+            pass
+        return False
+
+    def _get_kbuild_ldflags(self):
+        """Get KBUILD_LDFLAGS from make."""
+        try:
+            result = subprocess.run(
+                ['make', '-p', '-f', 'Makefile', 'vmlinux'],
+                cwd=self.directory,
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            for line in result.stdout.split('\n'):
+                if line.startswith('KBUILD_LDFLAGS = '):
+                    return line.split('=', 1)[1].strip()
+        except Exception:
+            pass
+        # Default flags for arm64
+        return '-EL -maarch64elf -z noexecstack --no-warn-rwx-segments'
+
+    def _get_kbuild_lds(self):
+        """Get KBUILD_LDS path."""
+        # First check if the linker script exists
         for arch in ['arm64', 'x86', 'riscv', 'arm', 'mips', 'powerpc']:
             lds = os.path.join(self.directory, f'arch/{arch}/kernel/vmlinux.lds')
             if os.path.exists(lds):
                 return lds
+        return None
+
+    def _find_linker_script(self):
+        """Find the linker script for the architecture."""
+        # Try common locations (both .lds and .lds.S)
+        for arch in ['arm64', 'x86', 'riscv', 'arm', 'mips', 'powerpc']:
+            # Check for preprocessed .lds file first
+            lds = os.path.join(self.directory, f'arch/{arch}/kernel/vmlinux.lds')
+            if os.path.exists(lds):
+                return lds
+            # Check for .lds.S source file
+            lds_s = os.path.join(self.directory, f'arch/{arch}/kernel/vmlinux.lds.S')
+            if os.path.exists(lds_s):
+                return lds_s
         return None
 
     def _write_modules_rules(self, f):
