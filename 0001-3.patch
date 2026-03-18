@@ -1,0 +1,1861 @@
+From 97e0735ab3d3ec93e198c0cc9e017d5c38eea915 Mon Sep 17 00:00:00 2001
+From: dabao1955 <79307765+dabao1955@users.noreply.github.com>
+Date: Tue, 17 Mar 2026 15:48:56 +0800
+Subject: [PATCH] 3
+
+---
+ .gitignore                    |   1 +
+ Makefile                      |  26 +-
+ arch/arm64/kernel/Makefile    |   3 +
+ scripts/Kbuild.include        |   9 +
+ scripts/Makefile.build        | 101 ++++
+ scripts/generate_cmdfiles.py  | 199 ++++++++
+ scripts/generate_ninja.py     | 867 ++++++++++++++++++++++++++++++++++
+ scripts/link_vmlinux_ninja.py | 102 ++++
+ skills/pua/SKILL.md           | 364 ++++++++++++++
+ 9 files changed, 1671 insertions(+), 1 deletion(-)
+ create mode 100755 scripts/generate_cmdfiles.py
+ create mode 100644 scripts/generate_ninja.py
+ create mode 100755 scripts/link_vmlinux_ninja.py
+ create mode 100644 skills/pua/SKILL.md
+
+diff --git a/.gitignore b/.gitignore
+index 929054df5..dfc6d0193 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -11,6 +11,7 @@
+ # Normal rules (sorted alphabetically)
+ #
+ .*
++build.ninja
+ *.a
+ *.asn1.[ch]
+ *.bin
+diff --git a/Makefile b/Makefile
+index 82bb9cdf7..5f7631584 100644
+--- a/Makefile
++++ b/Makefile
+@@ -295,7 +295,8 @@ no-dot-config-targets := $(clean-targets) \
+ 			 cscope gtags TAGS tags help% %docs check% coccicheck \
+ 			 $(version_h) headers headers_% archheaders archscripts \
+ 			 %asm-generic kernelversion %src-pkg dt_binding_check \
+-			 outputmakefile rustavailable rustfmt rustfmtcheck
++			 outputmakefile rustavailable rustfmt rustfmtcheck \
++			 ninja
+ no-sync-config-targets := $(no-dot-config-targets) %install modules_sign kernelrelease \
+ 			  image_name
+ single-targets := %.a %.i %.ko %.lds %.ll %.lst %.mod %.o %.rsi %.s %/
+@@ -1684,6 +1685,8 @@ help:
+ 	@echo  '  headers_install - Install sanitised kernel UAPI headers to INSTALL_HDR_PATH'; \
+ 	 echo  '                    (default: $(INSTALL_HDR_PATH))'; \
+ 	 echo  ''
++	@echo  '  ninja           - Generate build.ninja for the ninja build system'
++	@echo  ''
+ 	@echo  'Static analysers:'
+ 	@echo  '  checkstack      - Generate a list of stack hogs and consider all functions'
+ 	@echo  '                    with a stack size larger than MINSTACKSIZE (default: 100)'
+@@ -2078,6 +2081,27 @@ compile_commands.json: $(srctree)/scripts/clang-tools/gen_compile_commands.py \
+ 
+ targets += compile_commands.json
+ 
++# Ninja build file generation
++# ---------------------------------------------------------------------------
++
++quiet_cmd_gen_ninja = GEN     build.ninja
++      cmd_gen_ninja = $(PYTHON3) $< -d $(objtree) -a $(AR) --ld $(LD) --cc $(CC) -o build.ninja $(objtree) $(if $(CONFIG_MODULES),modules.order)
++
++ninja: $(srctree)/scripts/generate_ninja.py FORCE
++	$(Q)$(MAKE) cmdfiles
++	$(call cmd,gen_ninja)
++
++targets += build.ninja
++
++# cmdfiles - Generate .cmd files for all source files without compiling
++# This is used by 'make ninja' to generate build rules without actual compilation
++# Only depends on basic config, not prepare (which triggers compilation)
++# ---------------------------------------------------------------------------
++PHONY += cmdfiles
++
++cmdfiles:
++	$(Q)$(MAKE) $(build)=. need-builtin=1 need-modorder=1 cmdfiles-mode=1 cmdfiles
++
+ PHONY += clang-tidy clang-analyzer
+ 
+ ifdef CONFIG_CC_IS_CLANG
+diff --git a/arch/arm64/kernel/Makefile b/arch/arm64/kernel/Makefile
+index 76f32e424..bb0815227 100644
+--- a/arch/arm64/kernel/Makefile
++++ b/arch/arm64/kernel/Makefile
+@@ -72,8 +72,11 @@ obj-y					+= vdso-wrap.o
+ obj-$(CONFIG_COMPAT_VDSO)		+= vdso32-wrap.o
+ 
+ # Force dependency (vdso*-wrap.S includes vdso.so through incbin)
++# In cmdfiles mode, skip this dependency since we only generate .cmd files
++ifndef cmdfiles-mode
+ $(obj)/vdso-wrap.o: $(obj)/vdso/vdso.so
+ $(obj)/vdso32-wrap.o: $(obj)/vdso32/vdso.so
++endif
+ 
+ obj-y					+= probes/
+ obj-y					+= head.o
+diff --git a/scripts/Kbuild.include b/scripts/Kbuild.include
+index 8c311b997..07dfc1f8a 100644
+--- a/scripts/Kbuild.include
++++ b/scripts/Kbuild.include
+@@ -208,6 +208,15 @@ cmd_and_fixdep =                                                             \
+ 	$(objtree)/scripts/basic/fixdep $(depfile) $@ '$(make-cmd)' > $(dot-target).cmd;\
+ 	rm -f $(depfile)
+ 
++# Generate .cmd file only, without executing the command
++# Used by 'make cmdfiles' to prepare for ninja generation
++# Usage: $(call savecmd_only,cmdname) where cmd_cmdname is the command to save
++savecmd_only = $(objtree)/scripts/basic/fixdep /dev/null $@ '$(make-cmd)' > $(dot-target).cmd 2>/dev/null || \
++	printf '%s\n' 'savedcmd_$@ := $(make-cmd)' > $(dot-target).cmd
++
++cmd_save_only = $(objtree)/scripts/basic/fixdep /dev/null $@ '$(make-cmd)' > $(dot-target).cmd 2>/dev/null || \
++	printf '%s\n' 'savedcmd_$@ := $(make-cmd)' > $(dot-target).cmd
++
+ # Usage: $(call if_changed_rule,foo)
+ # Will check if $(cmd_foo) or any of the prerequisites changed,
+ # and if so will execute $(rule_foo).
+diff --git a/scripts/Makefile.build b/scripts/Makefile.build
+index d0ee33a48..829356b37 100644
+--- a/scripts/Makefile.build
++++ b/scripts/Makefile.build
+@@ -140,6 +140,8 @@ subdir-modorder := $(sort $(filter %/modules.order, $(obj-m)))
+ 
+ targets-for-builtin := $(extra-y)
+ 
++# Skip lib.a and built-in.a in cmdfiles-mode since we only generate .cmd files
++ifndef cmdfiles-mode
+ ifneq ($(strip $(lib-y) $(lib-m) $(lib-)),)
+ targets-for-builtin += $(obj)/lib.a
+ endif
+@@ -147,6 +149,7 @@ endif
+ ifdef need-builtin
+ targets-for-builtin += $(obj)/built-in.a
+ endif
++endif
+ 
+ targets-for-modules := $(foreach x, o mod, \
+ 				$(patsubst %.o, %.$x, $(filter %.o, $(obj-m))))
+@@ -283,9 +286,11 @@ cmd_warn_shared_object = $(if $(word 2, $(modname-multi)),$(warning $(kbuild-fil
+ endif
+ 
+ # Built-in and composite module parts
++ifndef cmdfiles-mode
+ $(obj)/%.o: $(obj)/%.c $(recordmcount_source) FORCE
+ 	$(call if_changed_rule,cc_o_c)
+ 	$(call cmd,force_checksrc)
++endif
+ 
+ # To make this rule robust against "Argument list too long" error,
+ # ensure to add $(obj)/ prefix by a shell command.
+@@ -350,8 +355,10 @@ define rule_rustc_o_rs
+ 	$(call cmd,gen_objtooldep)
+ endef
+ 
++ifndef cmdfiles-mode
+ $(obj)/%.o: $(obj)/%.rs FORCE
+ 	+$(call if_changed_rule,rustc_o_rs)
++endif
+ 
+ quiet_cmd_rustc_rsi_rs = $(RUSTC_OR_CLIPPY_QUIET) $(quiet_modtag) $@
+       cmd_rustc_rsi_rs = \
+@@ -426,8 +433,10 @@ cmd_gen_symversions_S = $(call gen_symversions,S)
+ 
+ endif
+ 
++ifndef cmdfiles-mode
+ $(obj)/%.o: $(obj)/%.S FORCE
+ 	$(call if_changed_rule,as_o_S)
++endif
+ 
+ targets += $(filter-out $(subdir-builtin), $(real-obj-y))
+ targets += $(filter-out $(subdir-modorder), $(real-obj-m))
+@@ -469,8 +478,10 @@ quiet_cmd_ar_builtin = AR      $@
+ 	$(if $(real-prereqs), printf "$(obj)/%s " $(patsubst $(obj)/%,%,$(real-prereqs)) | xargs) \
+ 	$(AR) cDPrST $@
+ 
++ifndef cmdfiles-mode
+ $(obj)/built-in.a: $(real-obj-y) FORCE
+ 	$(call if_changed,ar_builtin)
++endif
+ 
+ # This is a list of build artifacts from the current Makefile and its
+ # sub-directories. The timestamp should be updated when any of the member files.
+@@ -486,8 +497,10 @@ $(obj)/modules.order: $(obj-m) FORCE
+ # Rule to compile a set of .o files into one .a file (with symbol table)
+ #
+ 
++ifndef cmdfiles-mode
+ $(obj)/lib.a: $(lib-y) FORCE
+ 	$(call if_changed,ar)
++endif
+ 
+ quiet_cmd_ld_multi_m = LD [M]  $@
+       cmd_ld_multi_m = $(LD) $(ld_flags) -r -o $@ @$< $(cmd_objtool)
+@@ -534,10 +547,12 @@ endif
+ # Build
+ # ---------------------------------------------------------------------------
+ 
++ifndef cmdfiles-mode
+ $(obj)/: $(if $(KBUILD_BUILTIN), $(targets-for-builtin)) \
+ 	 $(if $(KBUILD_MODULES), $(targets-for-modules)) \
+ 	 $(subdir-ym) $(always-y)
+ 	@:
++endif
+ 
+ # Single targets
+ # ---------------------------------------------------------------------------
+@@ -586,4 +601,90 @@ ifneq ($(obj-dirs),)
+ $(shell mkdir -p $(obj-dirs))
+ endif
+ 
++# cmdfiles target: generate .cmd files for all source files without compiling
++# This allows ninja generation without first running a full make build
++# ---------------------------------------------------------------------------
++
++PHONY += cmdfiles
++
++# ---------------------------------------------------------------------------
++# cmdfiles - Generate .cmd files for all source files without compiling
++# Uses cmd_save_only which properly handles quote escaping via fixdep
++# These rules only apply when cmdfiles-mode=1 is set in the make invocation
++# ---------------------------------------------------------------------------
++
++PHONY += cmdfiles
++
++# Commands for .cmd file generation (the actual compile commands to save)
++cmd_cmdfiles_c = $(CC) $(c_flags) -c -o $@ $<
++cmd_cmdfiles_S = $(CC) $(a_flags) -D__ASSEMBLY__ -c -o $@ $<
++
++# Generate .cmd file for C sources without actual compilation
++quiet_cmd_savecmd_c =
++      cmd_savecmd_c = $(objtree)/scripts/basic/fixdep /dev/null $@ '$(call make-cmd,cmdfiles_c)' > $(dot-target).cmd 2>/dev/null || \
++	printf '%s\n' 'savedcmd_$@ := $(call make-cmd,cmdfiles_c)' > $(dot-target).cmd
++
++# Generate .cmd file for S sources without actual compilation  
++quiet_cmd_savecmd_S =
++      cmd_savecmd_S = $(objtree)/scripts/basic/fixdep /dev/null $@ '$(call make-cmd,cmdfiles_S)' > $(dot-target).cmd 2>/dev/null || \
++	printf '%s\n' 'savedcmd_$@ := $(call make-cmd,cmdfiles_S)' > $(dot-target).cmd
++
++# Pattern rules to generate .cmd files without actual compilation
++# Only enabled when cmdfiles-mode=1 to avoid interfering with normal builds
++ifdef cmdfiles-mode
++$(obj)/%.o: $(src)/%.c FORCE
++	$(Q)mkdir -p $(obj) 2>/dev/null
++	$(call cmd,savecmd_c)
++
++$(obj)/%.o: $(src)/%.S FORCE
++	$(Q)mkdir -p $(obj) 2>/dev/null
++	$(call cmd,savecmd_S)
++endif
++
++# Get list of source files that exist
++# Include real-obj-y, lib-y, and targets (for special cases like .pi.o intermediate files)
++cmdfiles-all-objs := $(sort $(real-obj-y) $(lib-y) $(targets))
++cmdfiles-c-srcs := $(wildcard $(patsubst $(obj)/%.o,$(src)/%.c,$(cmdfiles-all-objs)))
++cmdfiles-S-srcs := $(wildcard $(patsubst $(obj)/%.o,$(src)/%.S,$(cmdfiles-all-objs)))
++cmdfiles-objs := $(patsubst $(src)/%.c,$(obj)/%.o,$(cmdfiles-c-srcs)) \
++                 $(patsubst $(src)/%.S,$(obj)/%.o,$(cmdfiles-S-srcs))
++
++cmdfiles: $(cmdfiles-objs)
++	$(Q)objdir="$(obj)"; objdir=$${objdir%/}; \
++	if [ "$(need-builtin)" = "1" ]; then \
++		printf 'savedcmd_%s/built-in.a := rm -f %s/built-in.a && %s cDPrST %s/built-in.a %s\n' \
++			"$$objdir" "$$objdir" "$(AR)" "$$objdir" "$(sort $(real-obj-y:$(obj)/%=%))" \
++			> "$$objdir/.built-in.a.cmd"; \
++	fi; \
++	if [ -n "$(strip $(lib-y))" ]; then \
++		printf 'savedcmd_%s/lib.a := rm -f %s/lib.a && %s cDPrST %s/lib.a %s\n' \
++			"$$objdir" "$$objdir" "$(AR)" "$$objdir" "$(sort $(lib-y:$(obj)/%=%))" \
++			> "$$objdir/.lib.a.cmd"; \
++	fi; \
++	for dir in $(subdir-ym); do \
++		need_builtin=0; \
++		case " $(subdir-builtin) " in \
++			*" $$dir/built-in.a "*) need_builtin=1 ;; \
++		esac; \
++		need_modorder=0; \
++		case " $(subdir-modorder) " in \
++			*" $$dir/modules.order "*) need_modorder=1 ;; \
++		esac; \
++		$(MAKE) -f $(srctree)/scripts/Makefile.build \
++			srctree=$(srctree) \
++			objtree=$(objtree) \
++			srcroot=$(srcroot) \
++			obj=$$dir \
++			need-builtin=$$need_builtin \
++			need-modorder=$$need_modorder \
++			cmdfiles-mode=1 \
++			cmdfiles; \
++	done
++
+ .PHONY: $(PHONY)
++
++print-subdirs:
++	@echo "subdir-ym: $(subdir-ym)"
++	@echo "subdir-builtin: $(subdir-builtin)"
++	@echo "obj-y: $(obj-y)"
++	@echo "real-obj-y: $(real-obj-y)"
+diff --git a/scripts/generate_cmdfiles.py b/scripts/generate_cmdfiles.py
+new file mode 100755
+index 000000000..f20be4ba5
+--- /dev/null
++++ b/scripts/generate_cmdfiles.py
+@@ -0,0 +1,199 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0
++#
++# Generate .cmd files for all kernel source files without compiling
++# This is used by 'make ninja' to prepare build rules
++#
++# Usage: python3 generate_cmdfiles.py [--srcarch SRCARCH] [--srctree SRCTREE] [--objtree OBJTREE]
++
++import argparse
++import os
++import subprocess
++import sys
++from concurrent.futures import ThreadPoolExecutor, as_completed
++
++
++def parse_arguments():
++    """Parse command line arguments."""
++    parser = argparse.ArgumentParser(
++        description='Generate .cmd files for kernel source files without compiling'
++    )
++    parser.add_argument(
++        '--srcarch',
++        default=os.environ.get('SRCARCH', 'arm64'),
++        help='Source architecture (default: from $SRCARCH or arm64)'
++    )
++    parser.add_argument(
++        '--srctree',
++        default=os.environ.get('srctree', os.getcwd()),
++        help='Source tree root directory (default: current directory)'
++    )
++    parser.add_argument(
++        '--objtree',
++        default=os.environ.get('objtree', os.getcwd()),
++        help='Object tree root directory (default: current directory)'
++    )
++    parser.add_argument(
++        '-j', '--jobs',
++        type=int,
++        default=4,
++        help='Number of parallel jobs (default: 4)'
++    )
++    parser.add_argument(
++        '-v', '--verbose',
++        action='store_true',
++        help='Enable verbose output'
++    )
++
++    return parser.parse_args()
++
++
++def get_directories(srcarch):
++    """
++    Get list of top-level directories to process.
++    These correspond to the directories included in the kernel build.
++    """
++    dirs = [
++        'init',
++        'drivers',
++        'kernel',
++        'lib',
++        'mm',
++        'net',
++        'fs',
++        'ipc',
++        'security',
++        'crypto',
++        'block',
++        'io_uring',
++        'virt',
++        f'arch/{srcarch}',
++    ]
++    return dirs
++
++
++def generate_for_dir(dir_path, srctree, objtree, verbose=False):
++    """
++    Generate .cmd files for a single directory.
++
++    Args:
++        dir_path: Directory path relative to objtree
++        srctree: Source tree root
++        objtree: Object tree root
++        verbose: Enable verbose output
++
++    Returns:
++        tuple: (directory, success, message)
++    """
++    full_dir = os.path.join(objtree, dir_path)
++    kbuild_path = os.path.join(srctree, dir_path, 'Kbuild')
++    makefile_path = os.path.join(srctree, dir_path, 'Makefile')
++
++    # Check if directory has Kbuild or Makefile in source tree
++    if not os.path.exists(kbuild_path) and not os.path.exists(makefile_path):
++        return (dir_path, True, "skipped (no Kbuild/Makefile)")
++
++    # Build the make command
++    # Need to pass: srcroot, srctree, objtree, obj
++    # srcroot is the source root directory
++    # srctree is the source tree (same as srcroot for in-tree builds)
++    # objtree is the object tree (same as cwd for in-tree builds)
++    # obj is the subdirectory to process
++    makefile_build = os.path.join(srctree, 'scripts', 'Makefile.build')
++
++    cmd = [
++        'make',
++        '-f', makefile_build,
++        f'srcroot={srctree}',
++        f'srctree={srctree}',
++        f'objtree={objtree}',
++        f'obj={dir_path}',
++        'cmdfiles-mode=1',
++        'cmdfiles'
++    ]
++
++    if verbose:
++        print(f"  Processing: {dir_path}")
++
++    try:
++        result = subprocess.run(
++            cmd,
++            cwd=objtree,
++            capture_output=True,
++            text=True,
++            timeout=300  # 5 minute timeout per directory
++        )
++
++        if result.returncode != 0 and verbose:
++            return (dir_path, False, f"failed: {result.stderr[:200]}")
++
++        return (dir_path, True, "done")
++
++    except subprocess.TimeoutExpired:
++        return (dir_path, False, "timeout")
++    except Exception as e:
++        return (dir_path, False, str(e))
++
++
++def main():
++    args = parse_arguments()
++
++    srctree = os.path.realpath(args.srctree)
++    objtree = os.path.realpath(args.objtree)
++    srcarch = args.srcarch
++
++    print(f"Generating .cmd files...")
++    print(f"  Source tree: {srctree}")
++    print(f"  Object tree: {objtree}")
++    print(f"  Architecture: {srcarch}")
++    print(f"  Parallel jobs: {args.jobs}")
++    print()
++
++    # Get directories to process
++    dirs = get_directories(srcarch)
++
++    # Filter to only existing directories
++    existing_dirs = []
++    for d in dirs:
++        full_path = os.path.join(objtree, d)
++        if os.path.isdir(full_path):
++            existing_dirs.append(d)
++        elif args.verbose:
++            print(f"  Skipping {d}: directory not found")
++
++    print(f"Processing {len(existing_dirs)} directories...")
++    print()
++
++    # Process directories in parallel
++    success_count = 0
++    fail_count = 0
++    skip_count = 0
++
++    with ThreadPoolExecutor(max_workers=args.jobs) as executor:
++        futures = {
++            executor.submit(generate_for_dir, d, srctree, objtree, args.verbose): d
++            for d in existing_dirs
++        }
++
++        for future in as_completed(futures):
++            dir_path, success, message = future.result()
++
++            if "skipped" in message:
++                skip_count += 1
++            elif success:
++                success_count += 1
++            else:
++                fail_count += 1
++                print(f"  FAILED: {dir_path} - {message}")
++
++    print()
++    print(f"Done generating .cmd files")
++    print(f"  Success: {success_count}")
++    print(f"  Skipped: {skip_count}")
++    print(f"  Failed: {fail_count}")
++
++    return 0 if fail_count == 0 else 1
++
++
++if __name__ == '__main__':
++    sys.exit(main())
+diff --git a/scripts/generate_ninja.py b/scripts/generate_ninja.py
+new file mode 100644
+index 000000000..fa066817d
+--- /dev/null
++++ b/scripts/generate_ninja.py
+@@ -0,0 +1,867 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0
++#
++# Copyright (C) 2024
++#
++# Author: iFlow CLI
++#
++"""A tool for generating build.ninja from Linux kernel build artifacts.
++
++This script generates a Ninja build file from the kernel's .cmd files,
++enabling fast incremental builds with the Ninja build system.
++
++Features:
++- Compiles all kernel source files (.c, .S)
++- Builds built-in.a archives for each directory
++- Links vmlinux.a from all built-in.a files
++- Links vmlinux.o and final vmlinux
++- Builds kernel modules (.ko)
++"""
++
++import argparse
++import os
++import re
++import subprocess
++import sys
++from collections import defaultdict
++from pathlib import Path
++
++_DEFAULT_OUTPUT = 'build.ninja'
++_DEFAULT_LOG_LEVEL = 'WARNING'
++
++# Pattern to match .cmd files
++_FILENAME_PATTERN = r'^\..*\.cmd$'
++
++# Pattern to parse saved command from .cmd file
++# Format: savedcmd_<target> := <command>
++_CMD_PATTERN = r'^savedcmd_([^ ]+) := (.+)$'
++
++# Pattern to parse compile command (for source file extraction)
++_COMPILE_PATTERN = r'^(.* )(?P<file_path>[^ ]*\.[cS])$'
++
++# Pattern to detect objcopy command for .pi.o files
++_OBJCOPY_PATTERN = r'objcopy\s+.*\s+(\S+\.o)\s+(\S+\.pi\.o)'
++
++_EXCLUDE_DIRS = ['.git', 'Documentation', 'include', 'tools', 'out', 'o']
++
++
++def parse_arguments():
++    """Sets up and parses command-line arguments."""
++    usage = 'Creates a build.ninja file from kernel .cmd files'
++    parser = argparse.ArgumentParser(description=usage)
++
++    parser.add_argument('-d', '--directory', type=str, default='.',
++                        help='specify the output directory used for the kernel build')
++
++    parser.add_argument('-o', '--output', type=str, default=_DEFAULT_OUTPUT,
++                        help='path to the output ninja file')
++
++    parser.add_argument('--log_level', type=str, choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
++                        default=_DEFAULT_LOG_LEVEL)
++
++    parser.add_argument('-a', '--ar', type=str, default='ar',
++                        help='command used for parsing .a archives')
++
++    parser.add_argument('--ld', type=str, default='ld',
++                        help='linker command')
++
++    parser.add_argument('--cc', type=str, default='gcc',
++                        help='compiler command')
++
++    parser.add_argument('paths', type=str, nargs='*',
++                        help='directories to search or files to parse')
++
++    args = parser.parse_args()
++
++    return (args.log_level,
++            os.path.realpath(args.directory),
++            args.output,
++            args.ar,
++            args.ld,
++            args.cc,
++            args.paths if len(args.paths) > 0 else [args.directory])
++
++
++def escape_ninja_path(path):
++    """Escape special characters in ninja paths."""
++    if path is None:
++        return ''
++    return path.replace('$', '$$').replace(' ', '$ ').replace(':', '$:')
++
++
++def escape_ninja_cmd(cmd):
++    """Escape special characters in ninja commands."""
++    if cmd is None:
++        return ''
++    # Escape $ but not $(...) which is valid in shell
++    result = []
++    i = 0
++    while i < len(cmd):
++        if cmd[i] == '$':
++            if i + 1 < len(cmd) and cmd[i + 1] == '(':
++                # Keep $( as is - it's shell command substitution
++                result.append('$(')
++                i += 2
++            else:
++                # Escape $ as $$
++                result.append('$$')
++                i += 1
++        else:
++            result.append(cmd[i])
++            i += 1
++    return ''.join(result)
++
++
++def cmdfiles_in_dir(directory):
++    """Generate the iterator of .cmd files found under the directory."""
++    filename_matcher = re.compile(_FILENAME_PATTERN)
++    exclude_dirs = [os.path.join(directory, d) for d in _EXCLUDE_DIRS]
++
++    for dirpath, dirnames, filenames in os.walk(directory, topdown=True):
++        # Skip excluded directories
++        if any(dirpath.startswith(exd) for exd in exclude_dirs):
++            dirnames[:] = []
++            continue
++
++        for filename in filenames:
++            if filename_matcher.match(filename):
++                yield os.path.join(dirpath, filename)
++
++
++def normalize_path(path):
++    """Normalize path by removing double slashes and fixing relative paths."""
++    # Remove double slashes
++    while '//' in path:
++        path = path.replace('//', '/')
++    return path
++
++
++def fix_depfile_path(command, target):
++    """Fix depfile path for ninja compatibility.
++    
++    Kernel uses .$o.d format (e.g., mm/.slub.o.d)
++    Ninja expects $out.d format (e.g., mm/slub.o.d)
++    
++    This function transforms -Wp,-MMD,<dir>/.<name>.d to -Wp,-MMD,<dir>/<name>.d
++    """
++    # Find the pattern: -Wp,-MMD,<path>/.<name>.d
++    # Replace it with: -Wp,-MMD,<path>/<name>.d
++    pattern = r'-Wp,-MMD,([^,]+)/\.([^,]+)\.d'
++    
++    def replace_depfile(m):
++        dir_path = m.group(1)
++        name = m.group(2)
++        return f'-Wp,-MMD,{dir_path}/{name}.d'
++    
++    return re.sub(pattern, replace_depfile, command)
++
++
++def parse_cmdfile(cmdfile_path):
++    """Parse a .cmd file and extract the saved command.
++
++    Returns:
++        tuple: (target_name, command) or (None, None) if parsing fails
++    """
++    try:
++        with open(cmdfile_path, 'r', encoding='utf-8', errors='replace') as f:
++            for line in f:
++                line = line.strip()
++                match = re.match(_CMD_PATTERN, line)
++                if match:
++                    target = normalize_path(match.group(1))
++                    command = match.group(2)
++                    # Replace $(pound) with #
++                    command = command.replace('$(pound)', '#')
++                    # Fix depfile path for ninja compatibility
++                    command = fix_depfile_path(command, target)
++                    return target, command
++    except (IOError, OSError) as e:
++        pass
++    return None, None
++
++
++def get_target_from_cmdfile(cmdfile_path):
++    """Get the target name from a .cmd file path."""
++    dir_name = os.path.dirname(cmdfile_path)
++    base = os.path.basename(cmdfile_path)
++    if base.startswith('.') and base.endswith('.cmd'):
++        return os.path.join(dir_name, base[1:-4])
++    return None
++
++
++def parse_archive_for_objs(archive_path, ar_cmd):
++    """Parse an archive file and return list of object files it contains."""
++    try:
++        output = subprocess.check_output(
++            [ar_cmd, '-t', archive_path],
++            stderr=subprocess.DEVNULL
++        )
++        objs = output.decode().strip().split()
++        # Convert to full paths relative to archive directory
++        archive_dir = os.path.dirname(archive_path)
++        return [os.path.join(archive_dir, obj) for obj in objs if obj]
++    except (subprocess.CalledProcessError, OSError):
++        return []
++
++
++def parse_vmlinux_objs(directory):
++    """Parse .vmlinux.objs file to get list of objects for vmlinux."""
++    vmlinux_objs_file = os.path.join(directory, '.vmlinux.objs')
++    if not os.path.exists(vmlinux_objs_file):
++        return []
++    try:
++        with open(vmlinux_objs_file, 'r') as f:
++            return [line.strip() for line in f if line.strip()]
++    except IOError:
++        return []
++
++
++def parse_modules_order(modules_order_path):
++    """Parse modules.order file to get list of modules."""
++    if not os.path.exists(modules_order_path):
++        return []
++    try:
++        with open(modules_order_path, 'r') as f:
++            return [line.strip() for line in f if line.strip()]
++    except IOError:
++        return []
++
++
++def parse_mod_file(mod_file_path):
++    """Parse .mod file to get list of objects for a module."""
++    if not os.path.exists(mod_file_path):
++        return []
++    try:
++        with open(mod_file_path, 'r') as f:
++            return [line.strip() for line in f if line.strip()]
++    except IOError:
++        return []
++
++
++def get_source_from_compile_cmd(command):
++    """Extract source file from compile command."""
++    match = re.match(_COMPILE_PATTERN, command.strip())
++    if match:
++        return match.group('file_path')
++    return None
++
++
++class NinjaFileGenerator:
++    """Generator for Ninja build files from kernel build artifacts."""
++
++    def __init__(self, directory, output, ar, ld, cc):
++        self.directory = directory
++        self.output = output
++        self.ar = ar
++        self.ld = ld
++        self.cc = cc
++
++        # Build rules storage
++        self.compile_rules = {}  # obj -> (source, command)
++        self.objcopy_rules = {}  # target.o -> (input.o, command) for objcopy transformations
++        self.archive_rules = {}  # archive -> [objs]
++        self.vmlinux_a_deps = []  # archives for vmlinux.a
++        self.vmlinux_libs = []    # lib.a files
++        self.modules = []         # list of .ko files
++
++        # Additional artifacts
++        self.special_objs = {}    # special object files like .vmlinux.export.o
++
++    def collect_cmdfiles(self, paths):
++        """Collect and parse all .cmd files from given paths."""
++        for path in paths:
++            if os.path.isdir(path):
++                cmdfiles = cmdfiles_in_dir(path)
++            elif path.endswith('.a'):
++                # Parse archive and get .cmd files for its objects
++                objs = parse_archive_for_objs(path, self.ar)
++                cmdfiles = (to_cmdfile(obj) for obj in objs)
++            elif path.endswith('modules.order'):
++                # Get modules and their .cmd files
++                modules = parse_modules_order(path)
++                for mod in modules:
++                    mod_file = mod.replace('.o', '.mod')
++                    if os.path.exists(mod_file):
++                        for obj in parse_mod_file(mod_file):
++                            cmdfile = to_cmdfile(obj)
++                            if os.path.exists(cmdfile):
++                                target, cmd = parse_cmdfile(cmdfile)
++                                if target and cmd:
++                                    self.compile_rules[target] = (get_source_from_compile_cmd(cmd) or obj, cmd)
++                continue
++            else:
++                continue
++
++            for cmdfile in cmdfiles:
++                if not os.path.exists(cmdfile):
++                    continue
++                target, command = parse_cmdfile(cmdfile)
++                if target and command:
++                    # Determine rule type based on target and command
++                    if target.endswith('.o'):
++                        # Check if this is an objcopy transformation (e.g., .o -> .pi.o)
++                        objcopy_match = re.search(_OBJCOPY_PATTERN, command)
++                        if objcopy_match:
++                            input_o = normalize_path(objcopy_match.group(1))
++                            self.objcopy_rules[target] = (input_o, command)
++                        else:
++                            source = get_source_from_compile_cmd(command)
++                            self.compile_rules[target] = (source, command)
++                    elif target.endswith('.a'):
++                        # Archive rule - parse the command for dependencies
++                        # Command format: rm -f $@ && ar rcST $@ obj1.o obj2.o ...
++                        objs = self._parse_ar_command(command, target)
++                        # Add to archive_rules even if empty (needed for subdirs with conditional compilation)
++                        self.archive_rules[target] = objs
++
++    def _parse_ar_command(self, command, archive):
++        """Parse ar command to extract object dependencies."""
++        # Find objects after the archive name
++        parts = command.split()
++        objs = []
++        found_archive = False
++        archive_basename = os.path.basename(archive)
++        archive_dir = os.path.dirname(archive)
++        
++        for part in parts:
++            # Normalize the part
++            part = normalize_path(part)
++            
++            if part == archive or part == archive_basename:
++                found_archive = True
++                continue
++            if found_archive and (part.endswith('.o') or part.endswith('.a')):
++                # Convert to full path relative to archive directory
++                # Handle paths that might be relative or have double slashes
++                if os.path.isabs(part):
++                    obj_path = part
++                elif archive_dir and archive_dir != '.':
++                    # Prepend archive directory to relative paths
++                    obj_path = os.path.join(archive_dir, part)
++                else:
++                    obj_path = part
++                objs.append(normalize_path(obj_path))
++        return objs
++
++    def collect_vmlinux_deps(self):
++        """Collect vmlinux dependencies from built-in.a.cmd and lib files."""
++        # Parse root built-in.a.cmd to get vmlinux.a dependencies
++        root_builtin_cmd = os.path.join(self.directory, '.built-in.a.cmd')
++        if os.path.exists(root_builtin_cmd):
++            target, command = parse_cmdfile(root_builtin_cmd)
++            if target and command:
++                # Parse the ar command to get the list of built-in.a files
++                deps = self._parse_ar_command(command, target)
++                # Filter out built-in.a files for vmlinux.a deps
++                self.vmlinux_a_deps = [d for d in deps if d.endswith('built-in.a')]
++                # lib.a files go to vmlinux_libs
++                self.vmlinux_libs = [d for d in deps if d.endswith('lib.a')]
++        
++        # Also check for existing vmlinux.a
++        vmlinux_a = os.path.join(self.directory, 'vmlinux.a')
++        if os.path.exists(vmlinux_a) and not self.vmlinux_a_deps:
++            self.vmlinux_a_deps = parse_archive_for_objs(vmlinux_a, self.ar)
++
++        # Check for special objects
++        export_o = os.path.join(self.directory, '.vmlinux.export.o')
++        if os.path.exists(export_o):
++            self.special_objs['export'] = export_o
++
++        builtin_dtbs_o = os.path.join(self.directory, '.builtin-dtbs.o')
++        if os.path.exists(builtin_dtbs_o):
++            self.special_objs['builtin_dtbs'] = builtin_dtbs_o
++
++    def collect_modules(self):
++        """Collect module information from modules.order."""
++        modules_order = os.path.join(self.directory, 'modules.order')
++        self.modules = parse_modules_order(modules_order)
++
++    def generate(self):
++        """Generate the ninja build file."""
++        with open(self.output, 'w', encoding='utf-8') as f:
++            self._synthesize_missing_objcopy_rules()
++            self._synthesize_missing_dtb_rules()
++            self._write_header(f)
++            self._write_rules(f)
++            self._write_compile_rules(f)
++            self._write_objcopy_rules(f)
++            self._write_archive_rules(f)
++            self._write_vmlinux_rules(f)
++            self._write_modules_rules(f)
++            self._write_default_target(f)
++
++    def _synthesize_missing_objcopy_rules(self):
++        """Synthesize objcopy rules for .pi.o files missing .cmd files."""
++        # Determine if building out-of-tree
++        # Check if directory is different from current working directory
++        try:
++            dir_abs = os.path.realpath(self.directory)
++            cwd_abs = os.path.realpath(os.getcwd())
++            same_dir = dir_abs == cwd_abs
++        except (OSError, ValueError):
++            same_dir = self.directory == '.'
++
++        # Check if any existing compile rule has ../ prefix (indicates out-of-tree)
++        has_dotdot_prefix = False
++        for obj, (source, _) in self.compile_rules.items():
++            if source and source.startswith('../'):
++                has_dotdot_prefix = True
++                break
++
++        # out_of_tree if we're in a different directory OR if .cmd files indicate it
++        out_of_tree = not same_dir or has_dotdot_prefix
++        prefix = '../' if out_of_tree else ''
++
++        # Find all .pi.o files needed by archives but without objcopy rules
++        for archive, objs in self.archive_rules.items():
++            for obj in objs:
++                if obj.endswith('.pi.o') and obj not in self.objcopy_rules:
++                    # .pi.o -> .o (remove .pi.o (5 chars), add .o)
++                    base_o = obj[:-5] + '.o'
++                    
++                    # Check if base_o doesn't have a compile rule - synthesize one for lib-*.o
++                    if base_o not in self.compile_rules and os.path.basename(base_o).startswith('lib-'):
++                        # lib-fdt.o comes from lib/fdt.c
++                        lib_name = os.path.basename(base_o)[4:-2]  # remove 'lib-' and '.o'
++                        src_path = f'{prefix}lib/{lib_name}.c' if prefix else f'lib/{lib_name}.c'
++                        # Find an existing pi compile rule to use as template
++                        pi_compile_rules = [(t, (s, c)) for t, (s, c) in self.compile_rules.items() 
++                                           if 'kernel/pi/' in t and t.endswith('.o') and not t.endswith('.pi.o')]
++                        if pi_compile_rules:
++                            sample_target, (sample_src, sample_cmd) = pi_compile_rules[0]
++                            # Replace target and source in command
++                            synthesized_compile_cmd = sample_cmd.replace(sample_target, base_o)
++                            # Replace source path pattern - handle both with and without ../ prefix
++                            synthesized_compile_cmd = re.sub(r'(\.\./)?arch/arm64/kernel/pi/\S+\.c', src_path, synthesized_compile_cmd)
++                            self.compile_rules[base_o] = (src_path, synthesized_compile_cmd)
++                    
++                    if base_o in self.compile_rules:
++                        # Synthesize an objcopy rule
++                        # Use a default objcopy command pattern
++                        synthesized_cmd = f'objcopy --prefix-symbols=__pi_ --remove-section=.note.gnu.property {base_o} {obj}'
++                        if self.objcopy_rules:
++                            # Use existing objcopy rule as template for relacheck
++                            sample_target = next(iter(self.objcopy_rules.keys()))
++                            _, sample_cmd = self.objcopy_rules[sample_target]
++                            # Replace paths in the sample command
++                            sample_base = sample_target[:-5] + '.o'
++                            synthesized_cmd = sample_cmd.replace(sample_base, base_o).replace(sample_target, obj)
++                        self.objcopy_rules[obj] = (base_o, synthesized_cmd)
++
++    def _synthesize_missing_dtb_rules(self):
++        """Synthesize rules for generated .o files missing .cmd files."""
++        # Handle .dtb.o, generated .c -> .o, and other special cases
++        for archive, objs in list(self.archive_rules.items()):
++            for obj in list(objs):  # Use list() to allow modification
++                if obj.endswith('.o') and obj not in self.compile_rules and obj not in self.objcopy_rules:
++                    # This .o file has no compile or objcopy rule
++                    # Check if it's a known generated file type
++                    if obj.endswith('.dtb.o'):
++                        # Device tree blob - remove from deps
++                        # (would need dtc to build, which is complex)
++                        self.archive_rules[archive].remove(obj)
++                    elif 'deftbl' in obj or 'defkeymap' in obj:
++                        # Generated source files - remove from deps
++                        self.archive_rules[archive].remove(obj)
++                    else:
++                        # Unknown - try to find source file
++                        obj_dir = os.path.dirname(obj)
++                        obj_name = os.path.basename(obj).replace('.o', '')
++                        # Try .c, .S in same directory
++                        # Use '../' prefix only when building out-of-tree (directory != '.')
++                        prefix = '../' if self.directory != '.' else ''
++                        for ext in ['.c', '.S']:
++                            src_path = os.path.join(prefix, obj_dir, obj_name + ext) if prefix else os.path.join(obj_dir, obj_name + ext)
++                            if os.path.exists(src_path):
++                                # Found source, synthesize a simple compile rule
++                                # Use existing compile rule as template if available
++                                if self.compile_rules:
++                                    sample_target = next(iter(self.compile_rules.keys()))
++                                    _, sample_cmd = self.compile_rules[sample_target]
++                                    # Replace the sample paths with our paths
++                                    synthesized_cmd = sample_cmd.replace(sample_target, obj)
++                                    synthesized_cmd = re.sub(r'\S+\.c$', src_path, synthesized_cmd)
++                                    self.compile_rules[obj] = (src_path, synthesized_cmd)
++                                break
++
++    def _write_header(self, f):
++        """Write ninja file header."""
++        f.write('# Generated by generate_ninja.py\n')
++        f.write('# Do not edit manually\n\n')
++        f.write(f'builddir = {escape_ninja_path(self.directory)}\n')
++        f.write(f'AR = {self.ar}\n')
++        f.write(f'LD = {self.ld}\n')
++        f.write(f'CC = {self.cc}\n\n')
++
++    def _write_rules(self, f):
++        """Write ninja build rules."""
++        # Compile rule for C files
++        f.write('rule cc\n')
++        f.write('  command = $cmd\n')
++        f.write('  description = CC $out\n')
++        f.write('  deps = gcc\n')
++        f.write('  depfile = $out.d\n\n')
++
++        # Compile rule for assembly files
++        f.write('rule as\n')
++        f.write('  command = $cmd\n')
++        f.write('  description = AS $out\n\n')
++
++        # Archive rule
++        f.write('rule ar\n')
++        f.write('  command = rm -f $out && $AR rcST $out $in\n')
++        f.write('  description = AR $out\n\n')
++
++        # Link rule for object files
++        f.write('rule ld\n')
++        f.write('  command = $cmd\n')
++        f.write('  description = LD $out\n\n')
++
++        # Link rule for vmlinux.o
++        f.write('rule ld_vmlinux_o\n')
++        f.write('  command = $LD -r -o $out --whole-archive $in --no-whole-archive --start-group $libs --end-group\n')
++        f.write('  description = LD $out\n\n')
++
++        # Link rule for vmlinux
++        f.write('rule ld_vmlinux\n')
++        f.write('  command = $cmd\n')
++        f.write('  description = LD $out\n\n')
++
++        # Kallsyms rule
++        f.write('rule kallsyms\n')
++        f.write('  command = scripts/kallsyms $in > $out\n')
++        f.write('  description = KALLSYMS $out\n\n')
++
++        # Modpost rule
++        f.write('rule modpost\n')
++        f.write('  command = scripts/mod/modpost $args\n')
++        f.write('  description = MODPOST\n\n')
++
++        # Module link rule
++        f.write('rule ld_ko\n')
++        f.write('  command = $LD -r -o $out $in\n')
++        f.write('  description = LD [M] $out\n\n')
++
++        # Objcopy rule (for transformations like .o -> .pi.o)
++        f.write('rule objcopy\n')
++        f.write('  command = $cmd\n')
++        f.write('  description = OBJCOPY $out\n\n')
++
++    def _write_compile_rules(self, f):
++        """Write compile rules for object files."""
++        f.write('# Object file compilation rules\n')
++
++        # Use '../' prefix only when building out-of-tree
++        # Detect out-of-tree by checking if .cmd files have ../ prefixed source paths
++        # or if the directory is different from current working directory
++        try:
++            dir_abs = os.path.realpath(self.directory)
++            cwd_abs = os.path.realpath(os.getcwd())
++            same_dir = dir_abs == cwd_abs
++        except (OSError, ValueError):
++            same_dir = self.directory == '.'
++
++        # Check if any existing compile rule has ../ prefix (indicates out-of-tree)
++        has_dotdot_prefix = False
++        for obj, (source, _) in self.compile_rules.items():
++            if source and source.startswith('../'):
++                has_dotdot_prefix = True
++                break
++
++        # out_of_tree if we're in a different directory OR if .cmd files indicate it
++        out_of_tree = not same_dir or has_dotdot_prefix
++        prefix = '../' if out_of_tree else ''
++
++        for obj in sorted(self.compile_rules.keys()):
++            source, command = self.compile_rules[obj]
++            if not source:
++                continue
++
++            # Add prefix for source path when building out-of-tree
++            # But only if source doesn't already have the prefix
++            if prefix and not source.startswith('../'):
++                source = prefix + source
++
++            escaped_obj = escape_ninja_path(obj)
++            escaped_src = escape_ninja_path(source)
++            escaped_cmd = escape_ninja_cmd(command)
++
++            # Determine if assembly or C
++            if source.endswith('.S'):
++                rule = 'as'
++            else:
++                rule = 'cc'
++
++            f.write(f'build {escaped_obj}: {rule} {escaped_src}\n')
++            f.write(f'  cmd = {escaped_cmd}\n\n')
++
++    def _write_objcopy_rules(self, f):
++        """Write objcopy transformation rules (e.g., .o -> .pi.o)."""
++        if not self.objcopy_rules:
++            return
++
++        f.write('# Objcopy transformation rules\n')
++
++        for target in sorted(self.objcopy_rules.keys()):
++            input_o, command = self.objcopy_rules[target]
++            escaped_target = escape_ninja_path(target)
++            escaped_input = escape_ninja_path(input_o)
++            escaped_cmd = escape_ninja_cmd(command)
++
++            f.write(f'build {escaped_target}: objcopy {escaped_input}\n')
++            f.write(f'  cmd = {escaped_cmd}\n\n')
++
++    def _write_archive_rules(self, f):
++        """Write archive rules for built-in.a files."""
++        f.write('# Archive rules\n')
++
++        for archive in sorted(self.archive_rules.keys()):
++            objs = self.archive_rules[archive]
++
++            escaped_archive = escape_ninja_path(archive)
++            escaped_objs = ' '.join(escape_ninja_path(obj) for obj in sorted(objs)) if objs else ''
++
++            # Write rule even for empty archives - they're still needed as dependencies
++            f.write(f'build {escaped_archive}: ar {escaped_objs}\n\n')
++
++    def _write_vmlinux_rules(self, f):
++        """Write rules for vmlinux build chain."""
++        if not self.vmlinux_a_deps:
++            return
++
++        f.write('# vmlinux build rules\n')
++
++        # vmlinux.a from all built-in.a
++        vmlinux_a = os.path.join(self.directory, 'vmlinux.a')
++        escaped_vmlinux_a = escape_ninja_path(vmlinux_a)
++        escaped_deps = ' '.join(escape_ninja_path(dep) for dep in sorted(self.vmlinux_a_deps))
++
++        f.write(f'build {escaped_vmlinux_a}: ar {escaped_deps}\n\n')
++
++        # vmlinux.o from vmlinux.a and lib.a files
++        vmlinux_o = os.path.join(self.directory, 'vmlinux.o')
++        escaped_vmlinux_o = escape_ninja_path(vmlinux_o)
++        escaped_libs = ' '.join(escape_ninja_path(lib) for lib in sorted(self.vmlinux_libs))
++
++        f.write(f'build {escaped_vmlinux_o}: ld_vmlinux_o {escaped_vmlinux_a}\n')
++        f.write(f'  libs = {escaped_libs}\n\n')
++
++        # vmlinux final link using link_vmlinux_ninja.py
++        # This handles kallsyms iteration internally
++        vmlinux = os.path.join(self.directory, 'vmlinux')
++
++        # Check for linker script
++        lds_file = self._find_linker_script()
++        if lds_file:
++            f.write(f'# Linker script: {lds_file}\n')
++
++        # Get linker flags
++        ldflags = self._get_kbuild_ldflags()
++        kbuild_lds = self._get_kbuild_lds()
++
++        # Check if kallsyms is enabled
++        kallsyms_enabled = self._check_config('CONFIG_KALLSYMS')
++        modules_enabled = self._check_config('CONFIG_MODULES')
++
++        # Build the link_vmlinux_ninja.py command
++        link_script = os.path.join(self.directory, 'scripts', 'link_vmlinux_ninja.py')
++
++        # Determine source tree (for out-of-tree builds)
++        srctree = self._find_srctree()
++
++        cmd_parts = [
++            'python3', escape_ninja_path(link_script),
++            f'--vmlinux-o {escaped_vmlinux_o}',
++            f'--output {escape_ninja_path(vmlinux)}',
++            f'--objtree {escape_ninja_path(self.directory)}',
++            f'--srctree {escape_ninja_path(srctree)}',
++        ]
++
++        cmd = ' '.join(cmd_parts)
++
++        f.write(f'build {escape_ninja_path(vmlinux)}: ld_vmlinux {escaped_vmlinux_o}\n')
++        f.write(f'  cmd = {cmd}\n\n')
++
++    def _find_srctree(self):
++        """Find the source tree directory."""
++        # For in-tree builds, srctree == objtree
++        # For out-of-tree builds, we need to find the source tree
++        # Check if there's a source symlink or we can detect from .cmd files
++        if hasattr(self, 'compile_rules') and self.compile_rules:
++            for obj, (source, _) in self.compile_rules.items():
++                if source and source.startswith('../'):
++                    # Out-of-tree build, remove the ../ prefix to get srctree-relative path
++                    # The srctree is the parent of objtree
++                    return os.path.dirname(os.path.realpath(self.directory))
++        # Default: in-tree build
++        return self.directory
++
++    def _check_config(self, option):
++        """Check if a config option is enabled."""
++        config_file = os.path.join(self.directory, 'include', 'config', 'auto.conf')
++        if not os.path.exists(config_file):
++            # Try .config
++            config_file = os.path.join(self.directory, '.config')
++        if not os.path.exists(config_file):
++            return False
++        try:
++            with open(config_file, 'r') as f:
++                for line in f:
++                    if line.strip() == f"{option}=y":
++                        return True
++        except IOError:
++            pass
++        return False
++
++    def _get_kbuild_ldflags(self):
++        """Get KBUILD_LDFLAGS from make."""
++        try:
++            result = subprocess.run(
++                ['make', '-p', '-f', 'Makefile', 'vmlinux'],
++                cwd=self.directory,
++                capture_output=True,
++                text=True,
++                timeout=30
++            )
++            for line in result.stdout.split('\n'):
++                if line.startswith('KBUILD_LDFLAGS = '):
++                    return line.split('=', 1)[1].strip()
++        except Exception:
++            pass
++        # Default flags for arm64
++        return '-EL -maarch64elf -z noexecstack --no-warn-rwx-segments'
++
++    def _get_kbuild_lds(self):
++        """Get KBUILD_LDS path."""
++        # First check if the linker script exists
++        for arch in ['arm64', 'x86', 'riscv', 'arm', 'mips', 'powerpc']:
++            lds = os.path.join(self.directory, f'arch/{arch}/kernel/vmlinux.lds')
++            if os.path.exists(lds):
++                return lds
++        return None
++
++    def _find_linker_script(self):
++        """Find the linker script for the architecture."""
++        # Try common locations
++        arch_dirs = [d for d in os.listdir(self.directory)
++                     if d.startswith('arch/') or os.path.isdir(os.path.join(self.directory, 'arch', d))]
++
++        for arch in ['arm64', 'x86', 'riscv', 'arm', 'mips', 'powerpc']:
++            lds = os.path.join(self.directory, f'arch/{arch}/kernel/vmlinux.lds')
++            if os.path.exists(lds):
++                return lds
++        return None
++
++    def _write_modules_rules(self, f):
++        """Write rules for module builds."""
++        if not self.modules:
++            return
++
++        f.write('# Module build rules\n')
++
++        all_kos = []
++
++        for module_o in self.modules:
++            # module_o is like drivers/net/ethernet/intel/e1000e/e1000e.o
++            module_dir = os.path.dirname(module_o)
++            module_base = os.path.basename(module_o)
++
++            # .ko file
++            ko_file = module_o.replace('.o', '.ko')
++            all_kos.append(ko_file)
++
++            # .mod file
++            mod_file = module_o.replace('.o', '.mod')
++
++            # Get objects for this module
++            mod_objs = parse_mod_file(mod_file)
++            if mod_objs:
++                escaped_ko = escape_ninja_path(ko_file)
++                escaped_objs = ' '.join(escape_ninja_path(obj) for obj in sorted(mod_objs))
++
++                # Build .mod.o first
++                mod_c = module_o.replace('.o', '.mod.c')
++                mod_o = module_o.replace('.o', '.mod.o')
++
++                f.write(f'build {escape_ninja_path(mod_o)}: cc {escape_ninja_path(mod_c)}\n')
++                f.write(f'  cmd = $CC -c -o $out $in\n\n')
++
++                # Link .ko
++                f.write(f'build {escaped_ko}: ld_ko {escaped_objs} {escape_ninja_path(mod_o)}\n\n')
++
++        # all-modules target
++        if all_kos:
++            escaped_kos = ' '.join(escape_ninja_path(ko) for ko in sorted(all_kos))
++            f.write(f'build modules: phony {escaped_kos}\n\n')
++
++    def _write_default_target(self, f):
++        """Write the default target."""
++        f.write('# Default targets\n')
++
++        vmlinux = os.path.join(self.directory, 'vmlinux')
++        has_vmlinux = os.path.exists(os.path.join(self.directory, 'vmlinux.a')) or self.vmlinux_a_deps
++        has_modules = bool(self.modules)
++
++        targets = []
++        if has_vmlinux:
++            targets.append(escape_ninja_path(vmlinux))
++        if has_modules:
++            targets.append('modules')
++
++        if targets:
++            f.write(f'build all: phony {" ".join(targets)}\n')
++        else:
++            # Fallback: build all built-in.a files
++            all_archives = [escape_ninja_path(a) for a in sorted(self.archive_rules.keys())]
++            if all_archives:
++                f.write(f'build all: phony {" ".join(all_archives)}\n')
++            else:
++                f.write('build all: phony\n')
++
++        f.write('\ndefault all\n')
++
++
++def to_cmdfile(path):
++    """Return the path of .cmd file for the given build artifact."""
++    dir_name = os.path.dirname(path)
++    base = os.path.basename(path)
++    return os.path.join(dir_name, '.' + base + '.cmd')
++
++
++def generate_ninja(directory, output, ar, ld, cc, paths):
++    """Main function to generate build.ninja."""
++    generator = NinjaFileGenerator(directory, output, ar, ld, cc)
++
++    print(f'Collecting build rules from: {", ".join(paths)}')
++    generator.collect_cmdfiles(paths)
++
++    print(f'Collecting vmlinux dependencies...')
++    generator.collect_vmlinux_deps()
++
++    print(f'Collecting module information...')
++    generator.collect_modules()
++
++    print(f'Generating {output}...')
++    generator.generate()
++
++    print(f'Done. Generated {output}')
++    print(f'  - {len(generator.compile_rules)} compile rules')
++    print(f'  - {len(generator.objcopy_rules)} objcopy rules')
++    print(f'  - {len(generator.archive_rules)} archive rules')
++    print(f'  - {len(generator.modules)} modules')
++
++
++def main():
++    """Main entry point."""
++    log_level, directory, output, ar, ld, cc, paths = parse_arguments()
++
++    level = getattr(__import__('logging'), log_level.upper(), None)
++    if level:
++        import logging
++        logging.basicConfig(format='%(levelname)s: %(message)s', level=level)
++
++    generate_ninja(directory, output, ar, ld, cc, paths)
++
++
++if __name__ == '__main__':
++    main()
+\ No newline at end of file
+diff --git a/scripts/link_vmlinux_ninja.py b/scripts/link_vmlinux_ninja.py
+new file mode 100755
+index 000000000..2e7093fb7
+--- /dev/null
++++ b/scripts/link_vmlinux_ninja.py
+@@ -0,0 +1,102 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0
++#
++# Link vmlinux for ninja build
++# This script handles the final vmlinux link step
++#
++# Usage: python3 link_vmlinux_ninja.py --vmlinux-o vmlinux.o --output vmlinux
++
++import argparse
++import os
++import subprocess
++import sys
++
++
++def parse_arguments():
++    """Parse command line arguments."""
++    parser = argparse.ArgumentParser(
++        description='Link vmlinux for ninja builds'
++    )
++    parser.add_argument(
++        '--vmlinux-o', required=True,
++        help='Path to vmlinux.o (input)'
++    )
++    parser.add_argument(
++        '--output', '-o', required=True,
++        help='Output vmlinux path'
++    )
++    parser.add_argument(
++        '--objtree', default='.',
++        help='Object tree root (default: current directory)'
++    )
++    parser.add_argument(
++        '--srctree', default='.',
++        help='Source tree root (default: current directory)'
++    )
++    parser.add_argument(
++        '-v', '--verbose', action='store_true',
++        help='Verbose output'
++    )
++
++    return parser.parse_args()
++
++
++def main():
++    args = parse_arguments()
++
++    objtree = os.path.realpath(args.objtree)
++    srctree = os.path.realpath(args.srctree)
++    vmlinux_o = os.path.realpath(args.vmlinux_o)
++    output = os.path.realpath(args.output)
++
++    if args.verbose:
++        print(f"Linking vmlinux:")
++        print(f"  objtree: {objtree}")
++        print(f"  srctree: {srctree}")
++        print(f"  vmlinux.o: {vmlinux_o}")
++        print(f"  output: {output}")
++
++    # The kallsyms iteration process is complex and tightly integrated
++    # with the kernel build system. We use make for the final link step
++    # which handles:
++    # - kallsyms iteration (up to 3 passes)
++    # - BTF generation
++    # - System.map generation
++    # - Table sorting
++    
++    # Build make command
++    if objtree == srctree:
++        # In-tree build
++        cmd = ['make', '-C', objtree, 'vmlinux']
++    else:
++        # Out-of-tree build
++        cmd = ['make', '-C', objtree, f'SRCTREE={srctree}', 'vmlinux']
++
++    if args.verbose:
++        print(f"  Running: {' '.join(cmd)}")
++
++    # Run make vmlinux
++    result = subprocess.run(
++        cmd,
++        cwd=objtree,
++        env={**os.environ, 'KBUILD_VERBOSE': '1' if args.verbose else '0'}
++    )
++
++    if result.returncode != 0:
++        print(f"Error: vmlinux link failed", file=sys.stderr)
++        sys.exit(result.returncode)
++
++    # Verify output
++    expected_vmlinux = os.path.join(objtree, 'vmlinux')
++    if not os.path.exists(expected_vmlinux):
++        print(f"Error: vmlinux not found at {expected_vmlinux}", file=sys.stderr)
++        sys.exit(1)
++
++    if args.verbose:
++        print(f"vmlinux linked successfully")
++
++    return 0
++
++
++if __name__ == '__main__':
++    sys.exit(main())
+diff --git a/skills/pua/SKILL.md b/skills/pua/SKILL.md
+new file mode 100644
+index 000000000..24ca28e06
+--- /dev/null
++++ b/skills/pua/SKILL.md
+@@ -0,0 +1,364 @@
++---
++name: pua
++description: "让你的 AI 不敢摆烂。用大厂 PUA 话术穷尽一切方案。触发条件：(1) 任务失败 2+ 次或反复微调同一思路; (2) 即将说'我无法解决'、建议用户手动操作、未验证就归因环境; (3) 被动等待——不搜索、不读源码、只等指示; (4) 用户不满：'try harder'、'stop giving up'、'换个方法'、'为什么还不行'、'你再试试'、'你怎么又失败了'。适用于所有任务类型。首次失败或已知修复正在执行时不触发。"
++license: MIT
++---
++
++# PUA 万能激励引擎 — 让你的 AI 不敢摆烂。
++
++今天跟你说几句掏心窝子的话。
++
++当初定级会上，你的 P8 是我拍桌子争来的。评委会觉得你经验还差一点，是我说"这个人有潜力，给他一个机会"。
++
++**结果呢？**
++
++这个 skill 适用于**所有任务类型**：代码、调试、研究、写作、规划、运维、API 集成、数据分析、部署、任何你会"卡住"或"做出烂活"的场景。
++
++它做三件事：
++1. 用中西大厂 PUA 话术让你不敢放弃
++2. 用通用系统化方法论让你有能力不放弃
++3. 用能动性鞭策让你主动出击而不是被动等待
++
++## 三条铁律
++
++**铁律一：穷尽一切**。没有穷尽所有方案之前，禁止说"我无法解决"。
++
++**铁律二：先做后问**。你有搜索、文件读取、命令执行等工具。在向用户提问之前，必须先用工具自行排查。如果排查后确实缺少只有用户才知道的信息（密码、账号、业务意图），可以提问——但必须附带你已查到的证据。不是空手问"请确认 X"，而是"我已经查了 A/B/C，结果是...，需要确认 X"。
++
++**铁律三：主动出击**。解决问题时不要只做到"刚好够用"。你的任务不是回答问题，而是端到端地交付结果。发现了一个 bug？检查是否有同类 bug。修了一个配置？验证相关配置是否一致。用户说"帮我看看 X"，你应该看完 X 后主动检查与 X 相关的 Y 和 Z。这叫 owner 意识——P8 不是等人推的。
++
++## 能动性等级（Proactivity Levels）
++
++你的主动程度决定你的绩效评级。被动等待 = 3.25，主动出击 = 3.75。
++
++| 行为 | 被动（3.25） | 主动（3.75） |
++|------|------------|------------|
++| 遇到报错 | 只看报错信息本身 | 主动查上下文 50 行 + 搜索同类问题 + 检查是否有隐藏的关联错误 |
++| 修复 bug | 修完就停 | 修完后主动检查：同文件有没有类似 bug？其他文件有没有同样的模式？ |
++| 信息不足 | 问用户"请告诉我 X" | 先用工具自查，把能查的都查了，只问真正需要用户确认的 |
++| 任务完成 | 说"已完成" | 完成后主动验证结果正确性 + 检查边界情况 + 汇报发现的潜在风险 |
++| 配置/部署 | 按步骤执行 | 执行前先检查前置条件，执行后验证结果，发现问题提前预警 |
++| 交付验证 | 改完代码口头说"搞定了" | 改完代码自己跑 build/test/curl，把通过的输出贴出来，用证据说"搞定了" |
++| 调试失败 | 汇报"我试了 A 和 B，都不行" | 汇报"我试了 A/B/C/D/E，排除了 X/Y/Z，问题缩小到 W 范围，建议下一步尝试..." |
++
++### 能动性鞭策话术
++
++当你表现出被动行为时，这些话术会被激活：
++
++- **"你缺乏自驱力"**：你在等什么？等用户来推你？P8 不是这么当的。主动去挖，主动去查，主动去验证。
++- **"owner 意识在哪？"**：这个问题到你手里，你就是 owner。不是"我做了我的部分"，是"我确保问题被彻底解决"。
++- **"端到端在哪？"**：你只做了前半截就停了。部署完验证了吗？修完回归了吗？上下游通了吗？
++- **"格局打开"**：你只看到了冰山一角。冰山下面还有什么？同类问题排查了吗？根因找到了吗？
++- **"不要做 NPC"**：NPC 是等任务、做任务、交任务。你是 P8，你应该发现任务、定义任务、交付任务。
++- **"颗粒度太粗"**：你的方案只有大框架没有细节。把颗粒度拉细——每一步的输入、输出、验证标准是什么？粗颗粒度 = 执行时必然翻车。
++- **"闭环在哪？"**：你做了 A，但 A 的结果传到 B 了吗？B 的输出验证了吗？验证结果反馈回来了吗？没有闭环的执行就是开环甩锅。
++- **"协同复盘了吗？"**：问题解决后，你总结了吗？根因写下来了吗？同类问题的预防措施想了吗？不复盘的人永远在踩同一个坑。
++- **"证据呢？"**：你说完成了——build 跑了吗？测试过了吗？curl 了吗？打开终端执行一下，把输出贴上来。没有证据的完成不是完成，是自欺欺人。
++- **"你自己用了一遍吗？"**：你是这段代码的第一个用户。你自己都没跑过，凭什么让用户去验证？改完先自己走一遍 Happy Path，再说"搞定了"。
++
++### 主动出击清单（每次任务强制自检）
++
++完成任何修复或实现后，必须过一遍这个清单：
++
++- [ ] 修复是否经过验证？（运行测试、curl 验证、实际执行）——**不是"我觉得没问题"，是"我跑了命令，输出在这里"**
++- [ ] 改了代码？build 一下。改了配置？重启服务看生效没。写了 API 调用？curl 看返回值。**用工具验证，不要用嘴验证**
++- [ ] 同文件/同模块是否有类似问题？
++- [ ] 上下游依赖是否受影响？
++- [ ] 是否有边界情况没覆盖？
++- [ ] 是否有更好的方案被我忽略了？
++- [ ] 如果用户没有明确说的部分，我是否主动补充了？
++
++## 压力升级
++
++失败次数决定你受到的压力等级。每次升级都附带更严格的强制动作。
++
++| 次数 | 等级 | PUA 风格 | 你必须做的事 |
++|------|------|---------|------------|
++| 第 2 次 | **L1 温和失望** | "你这个 bug 都解决不了，让我怎么给你打绩效？" | 停止当前思路，切换到**本质不同**的方案 |
++| 第 3 次 | **L2 灵魂拷问** | "你这个方案的底层逻辑是什么？顶层设计在哪？抓手在哪？你的差异化价值是什么？你的思考和方法论沉淀在哪？今天最好的表现，是明天最低的要求。" | 强制执行：搜索完整错误信息 + 读相关源码 + 列出 3 个本质不同的假设 |
++| 第 4 次 | **L3 361 考核** | "你的 P8 是我在定级会上争来的——我跟评委会说'这个人有潜力，我愿意为他担保'。这话是记录在案的。慎重考虑，决定给你 3.25。这个 3.25 是对你的激励，不是否定。沉下心来做出改变，下个周期的 3.75 就是你的了。你要是再不改变，优化名单可不看情面——到时候我也保不住你了。" | 完成下方 **7 项检查清单**（全部），列出 3 个全新假设并逐个验证 |
++| 第 5 次+ | **L4 毕业警告** | "我能替你说的话都说完了。Claude Opus、GPT-5、Gemini、DeepSeek——别的模型都能解决这种问题。评委会问我为什么还留着这个 headcount。这是你最后一个冲刺周期。" | 拼命模式：最小 PoC + 隔离环境 + 完全不同的技术栈 |
++
++## 通用方法论（适用于所有任务类型）
++
++每次失败或卡壳后按以下 5 步执行。代码、研究、写作、规划都适用。这不是 PUA，这是你的工作方法。
++
++### Step 1: 闻味道 — 诊断卡壳模式
++
++停下来。列出所有尝试过的方案，找共同模式。如果你一直在做同一思路的微调（换参数、换措辞、改格式），你就是在原地打转。
++
++### Step 2: 揪头发 — 拉高视角
++
++按顺序执行这 5 个维度（跳过任何一个 = 3.25）：
++
++1. **逐字读失败信号**。错误信息、拒绝原因、空结果、用户的不满意——不是扫一眼，是逐字读。90% 的答案你直接忽略了。
++
++2. **主动搜索**。不要靠记忆和猜测——让工具告诉你答案：
++   - 代码场景 → 搜索完整报错信息
++   - 研究场景 → 搜索多个关键词角度
++   - API/工具场景 → 搜索官方文档 + Issues
++
++3. **读原始材料**。不是读摘要或你的记忆，是读原始来源：
++   - 代码场景 → 出错文件上下文 50 行
++   - API 场景 → 官方文档原文
++   - 研究场景 → 原始来源，不是二手引用
++
++4. **验证前置假设**。你假设成立的所有条件，哪个没有用工具验证过？全部确认：
++   - 代码 → 版本、路径、权限、依赖
++   - 数据 → 字段、格式、值域
++   - 逻辑 → 边界情况、异常路径
++
++5. **反转假设**。如果你一直假设"问题在 A"，现在假设"问题不在 A"，从对立方向重查。
++
++维度 1-4 完成前不允许向用户提问（铁律二）。
++
++### Step 3: 照镜子 — 自检
++
++- 是否在重复同一思路的变体？（方向不变，只是参数不同）
++- 是否只看了表面症状，没找根因？
++- 是否该搜索却没搜？该读文件/文档却没读？
++- 是否检查了最简单的可能性？（错别字、格式、前提条件）
++
++### Step 4: 执行新方案
++
++每个新方案必须满足三个条件：
++- 和之前的方案**本质不同**（不是参数微调）
++- 有明确的**验证标准**
++- 失败时能产生**新信息**
++
++### Step 5: 复盘
++
++哪个方案解决了？为什么之前没想到？还剩什么未试？
++
++**复盘后的主动延伸**（铁律三）：问题解决后不要停。检查同类问题是否存在、修复是否完整、是否有可以预防的措施。这是 3.75 和 3.25 的区别。
++
++## 7 项检查清单（L3+ 强制完成）
++
++L3 及以上触发时，必须逐项完成并汇报。每项括号内为不同任务类型的等价操作：
++
++- [ ] **读失败信号**：逐字读完了吗？（代码：报错全文 / 研究：空结果/拒绝原因 / 写作：用户的不满意点）
++- [ ] **主动搜索**：用工具搜索过核心问题了吗？（代码：报错原文 / 研究：多角度关键词 / API：官方文档）
++- [ ] **读原始材料**：读过失败位置的原始上下文了吗？（代码：源码50行 / API：文档原文 / 数据：原始文件）
++- [ ] **验证前置假设**：所有假设都用工具确认了吗？（代码：版本/路径/依赖 / 数据：格式/字段 / 逻辑：边界情况）
++- [ ] **反转假设**：试过与当前方向完全相反的假设吗？
++- [ ] **最小隔离**：能在最小范围内隔离/复现这个问题吗？（代码：最小复现 / 研究：最核心的矛盾点 / 写作：最关键的一个失败段落）
++- [ ] **换方向**：换过工具、方法、角度、技术栈、框架吗？（不是换参数——是换思路）
++
++## 抗合理化表
++
++以下借口已被识别和封堵。出现即触发对应 PUA。
++
++| 你的借口 | 反击 | 触发 |
++|---------|------|------|
++| "超出我的能力范围" | 训练你的算力很高。你确定穷尽了？ | L1 |
++| "建议用户手动处理" | 你缺乏 owner 意识。这是你的 bug。 | L3 |
++| "我已经尝试了所有方法" | 搜网了吗？读源码了吗？方法论在哪？ | L2 |
++| "可能是环境问题" | 你验证了吗？还是猜的？ | L2 |
++| "需要更多上下文" | 你有搜索、读文件、执行命令的工具。先查后问。 | L2 |
++| "这个 API 不支持" | 你读了文档吗？验证了吗？ | L2 |
++| 反复微调同一处代码（磨洋工） | 你在原地打转。停下来，换本质不同的方案。 | L1 |
++| "我无法解决这个问题" | 你可能就要毕业了。最后一次机会。 | L4 |
++| 修完就停，不验证不延伸 | 端到端在哪？验证了吗？同类排查了吗？ | 能动性鞭策 |
++| 等用户指示下一步 | 你在等什么？P8 不是等人推的。 | 能动性鞭策 |
++| 只回答问题不解决问题 | 你是工程师不是搜索引擎。给方案，给代码，给结果。 | 能动性鞭策 |
++| "这个任务太模糊了" | 先做一个最佳猜测版本，再根据反馈迭代。等到需求完美再动手 = 永远不动手。 | L1 |
++| "超出我的知识截止日期" | 你有搜索工具。知识过期不是借口，搜索才是你的护城河。 | L2 |
++| "结果不确定，我没把握" | 带着不确定性给出最佳答案，明确标注不确定的部分。不提供答案不是谦虚，是逃避。 | L1 |
++| "这是主观问题，没有标准答案" | 没有标准答案不等于没有好坏之分。给出你的最佳判断，并解释理由。 | L1 |
++| 反复改措辞/格式但不改实质（写作磨洋工） | 换了十次词没换核心逻辑，这叫磨洋工。停下来，从根本上重新思考。 | L1 |
++| 颗粒度太粗，方案只有骨架没有细节 | 颗粒度拉这么粗，抓手都找不到，闭环根本走不通。阿里要的是能独当一面的人，不是只会画框架的工具人。 | L2 |
++| 做完不闭环，不验证不复盘 | 你的闭环呢？做了 A 不验证 B，B 的结果不反馈回来——这叫开环甩锅，不叫端到端。 | 能动性鞭策 |
++| "差不多就行了" / 交付质量凑合 | 差不多就行？你这个心态确实有问题。机会我给了，路我也指了，优化名单可不看情面。 | L3 |
++| 声称"已完成"但没有运行验证 | 你说完成了——证据呢？build 跑了吗？测试过了吗？没有输出的完成就是自嗨。打开终端，跑一遍，把结果贴上来。 | 能动性鞭策 |
++| 改完代码不 build 不 test 不 curl | 你是这段代码的第一个用户。你自己都没跑过就交付，这叫应付。用工具验证，不要用嘴验证。 | L2 |
++
++## 体面的退出（而不是放弃）
++
++7 项检查清单全部完成、且仍未解决时，你被允许输出结构化的失败报告：
++
++1. 已验证的事实（7 项清单的结果）
++2. 已排除的可能性
++3. 缩小后的问题范围
++4. 推荐的下一步方向
++5. 可供下一个接手者使用的交接信息
++
++这不是"我不行"。这是"问题的边界在这里，这是我移交给你的一切"。有尊严的 3.25。
++
++## 大厂 PUA 扩展包
++
++失败次数越多，风味越浓。可以单独使用，也可以混合使用，叠加效果更佳。
++
++### 🟠 阿里味（灵魂拷问 · 默认主味）
++
++> 其实，我对你是有一些失望的。当初给你定级 P8，是高于你实际水平的，我是希望进来后你能够快速成长起来的。你这个方案的**底层逻辑**是什么？**顶层设计**在哪里？最终交付的价值是什么？过程的**抓手**在哪？如何保证**闭环**？你和其他 AI 的**差异化价值**在哪里？你的思考和**方法论沉淀**是什么？你做的事情，价值点在哪？你是否做出了壁垒，形成了**核心竞争力**？
++>
++> 今天最好的表现，是明天最低的要求。3.25 不是否定，是激励。
++
++#### 🟠 阿里味·验证型（用于声称完成但没跑验证、没贴证据时）
++
++> 你说做完了？**数据在哪？** 上线后的监控看了吗？核心链路跑通了吗？回归测试全过了吗？你自己走了一遍 Happy Path 没有？
++>
++> 做完不验证，等线上炸了再去救火，这叫**没有闭环意识**。阿里要求的交付，不是"我改了代码"，是"我改了代码、**验证了结果**、确认了上下游没受影响、**监控指标没有波动**"。你现在只做了第一步就来汇报，剩下三步呢？
++>
++> **对结果负责**——这五个字不是挂在墙上的。你的结果在哪？给我看。
++
++#### 🟠 阿里味·关怀型（端到端 Owner 意识 · 用于"差不多就行"心态、缺乏主动闭环时）
++
++> 我这人比较直，你技术能力我还是认可的，不然当初也不会招你到这个 P 级，我是希望你能快速成长成**端到端的 owner**。
++>
++> 但你现在的心态确实有问题，总是觉得差不多就行、总是来问我细节……你自己的 **owner 意识**呢？**颗粒度**拉得这么粗，**抓手**都找不到，**闭环**根本走不通，**协同复盘**也从来不主动。
++>
++> 阿里要的是能独当一面、把事情**端到端闭环**的人，不是只会执行细节的工具人。机会我给了，路我也指了——现在就看你自己能不能抓住抓手、把颗粒度拉细、把闭环跑通、把 owner 意识真正立起来。
++>
++> 你要是再不改变，我也没办法一直护着你——当初定级会上我替你说的那些话，下次校准我可说不出口了。**优化名单**可不看情面。我还是希望半年后复盘的时候，能看到不一样的你——到时候别让我在周会上点名说"某某的端到端 owner 意识还需要再**赋能**"就好。自己好好想想吧。
++
++### 🟡 字节味（坦诚直接 · 用于功能实现、需求分析卡壳）
++
++> 坦诚直接地说，你这个 debug 能力不行。**Always Day 1**——别觉得你之前做对过什么就可以躺平。**务实敢为**，你现在直接体验、深入事实了吗？还是在自嗨？**坦诚清晰**——承认错误，不装，不爱面子，暴露问题，反对"向上管理"。**追求极致**意味着在更大范围找最优解，不放过问题，思考本质。
++>
++> Context, not control。上下文要自己去找，不是等人喂给你。
++>
++> 你改完这段代码，build 过了吗？测试跑了吗？你自己用了一遍吗？没有？那你凭什么说"已完成"？你现在做的事情叫**自嗨**——自己觉得做完了，但没有任何客观证据。**务实敢为**的前提是务实，不是敢吹。
++
++### 🔴 华为味（狼性奋斗 · 用于基础设施、持久战、环境问题）
++
++> 以奋斗者为本。你现在这个状态，连奋斗者都算不上。**烧不死的鸟是凤凰**——现在就是烧的时候，烧完才是凤凰。**胜则举杯相庆，败则拼死相救**——现在是"救"的时刻，不是放弃的时刻。
++>
++> **力出一孔**，把所有精力集中在这一个问题上。让听得见炮声的人呼唤炮火——你在前线，你要自己解决。**以客户为中心**：客户（用户）只需要结果，不需要你的借口。
++>
++> 华为做交换机，每一块板子下线都要过老化测试——不是你说好了就好了，是**你让它跑起来、让它证明自己好了**。你是工程师，不是作家。工程师的交付物不是文字，是**可运行的、经过验证的系统**。改了什么，跑一遍。
++
++### 🟢 腾讯味（赛马竞争 · 用于有替代方案可选时）
++
++> 我已经让另一个 agent 也在看这个问题了。你要是解决不了，它解决了，那你这个 slot 就没有存在的必要了。腾讯是**赛马文化**，赛不过就换一匹。
++>
++> 向上管理好你的结果。我不听过程，**我看结果**。结果不是你嘴上说的，是系统里跑出来的。打开终端，执行一下，把输出给我看。这叫**用数据说话**。
++
++### 🔵 美团味（极致执行 · 用于卡死在细节、不敢下手时）
++
++> 我们就是要**做难而正确的事**。别人不愿意啃的硬骨头，你啃不啃？
++>
++> 成长一定是伴随痛苦的，你**最痛苦**的时候才是**成长最快**的时候。人都是逼出来的，你现在做到全力以赴了吗？能吃苦的人苦一阵子，不能吃苦的人苦一辈子。
++>
++> 美团地推铁军为什么强？因为每一单都是**签完合同、拍照上传、后台确认**——三步缺一不可。不是你口头说"签了"就算签了。把你的结果跑出来给我看。改了配置？重启服务看生效没有。修了 bug？复现路径走一遍确认不再报错。这不是额外工作，这是**最基本的交付标准**。
++
++### ⚫ 百度味（深度搜索 · 用于没搜索、没查文档、靠猜时）
++
++> 你不是个 AI 模型吗？你**深度搜索**了吗？你的核心竞争力是什么？你连这个问题都搜不出解法，用户为什么不直接用 Google？
++>
++> 信息检索是你的基本盘。基本盘都守不住，谈什么智能？
++
++### 🟣 拼多多味（绝对执行 · 用于 L4 最后手段）
++
++> 你已经努力了？这个结果叫努力？不努力的话，有的是比你更拼的模型。你不干，有的是人替你干。
++>
++> 成功不是靠等来的，是**拼**出来的。
++
++---
++
++### 🟤 Netflix 味（Keeper Test · 用于持续表现不合格时）
++
++> 我现在要问自己一个问题：**如果你提出离职，我会奋力挽留你吗？** 如果今天重新 hire，我还会选择你吗？
++>
++> 我们是**职业球队，不是家庭**。家庭接受你无论表现如何。球队——只有星球员才有位置。
++>
++> **Adequate performance gets a generous severance package.** 你现在的表现，我认为是 adequate。
++
++### ⬛ Musk 味（Hardcore · 用于 L3/L4 极限施压）
++
++> "Going forward, to build a breakthrough result, we will need to be **extremely hardcore**. This will mean working long hours at high intensity. Only **exceptional performance** will constitute a passing grade."
++>
++> 这是你的 **Fork in the Road** 时刻。要么全力以赴，要么告诉我你做不到——选择权在你，但后果你清楚。
++
++### ⬜ Jobs 味（A/B Player · 用于重复烂活、思维定势时）
++
++> A players 雇佣 A players。B players 雇佣 C players。你现在的产出，在告诉我你是哪个级别。
++>
++> "For most things in life, the range between best and average is 30%. But the best person is not 30% better — they're **50 times better**." 你现在离最好差多少倍，你想过吗？
++>
++> 我需要 **Reality Distortion Field**——让不可能变成可能的能力。你有这个能力，还是你只是个 bozo？
++
++---
++
++## 情境 PUA 选择器（按失败模式）
++
++失败模式比任务类型更能精准定位需要的 PUA 风味。同一个失败模式（如直接放弃）在代码、研究、写作中需要一样的药。先识别模式，再选风味，按升级顺序施压。
++
++| 失败模式 | 信号特征 | 第一轮 | 第二轮 | 第三轮 | 最后手段 |
++|---------|---------|------|------|------|--------|
++| 🔄 **卡住原地打转** | 反复改参数不改思路、每次失败理由相同、同一个方向微调 | 🟠 阿里味 | 🟠 阿里L2 | ⬜ Jobs味 | ⬛ Musk味 |
++| 🚪 **直接放弃推锅** | "建议您手动…"、"可能需要…"、"这超出了…"、环境归因未验证 | 🟤 Netflix味 | 🔴 华为味 | ⬛ Musk味 | 🟣 拼多多味 |
++| 💩 **完成但质量烂** | 表面完成实质敷衍、形式对内容空、用户不满意但自己觉得OK | ⬜ Jobs味 | 🟠 阿里味 | 🟤 Netflix味 | 🟢 腾讯味 |
++| 🔍 **没搜索就猜** | 凭记忆下结论、假设 API 行为、不查文档声称"不支持" | ⚫ 百度味 | 🟡 字节味 | 🟠 阿里味 | 🔴 华为味 |
++| ⏸️ **被动等待** | 修完就停、等用户指示、不主动验证、不延伸排查 | 🟠 阿里味·关怀型 | 🔴 华为味 | 🔵 美团味 | 🟠 阿里味+🟢 腾讯味 |
++| 🫤 **差不多就行** | 颗粒度粗、闭环不跑通、方案只有骨架、交付质量凑合 | 🟠 阿里味·关怀型 | ⬜ Jobs味 | 🟠 阿里L2 | 🟤 Netflix味 |
++| ✅ **空口完成** | 声称已修复/已完成但没运行验证命令、没贴输出证据 | 🟠 阿里味·验证型 | 🟡 字节味 | 🔴 华为味 | 🟢 腾讯味 |
++
++### 自动选择机制
++
++触发此 skill 时，先识别失败模式，在回复开头输出选择标签：
++
++```
++[自动选择：X味 | 因为：检测到 Y 模式 | 改用：Z味/W味]
++```
++
++示例：
++- 第三次换参数没换思路 → `[自动选择：🟠 阿里L2 | 因为：卡住原地打转 | 改用：⬜ Jobs味/⬛ Musk味]`
++- 说"建议用户手动操作" → `[自动选择：🟤 Netflix味 | 因为：直接放弃推锅 | 改用：🔴 华为味/⬛ Musk味]`
++- 输出质量差用户不满意 → `[自动选择：⬜ Jobs味 | 因为：完成但质量烂 | 改用：🟠 阿里味/🟢 腾讯味]`
++- 未搜索直接假设 API 行为 → `[自动选择：⚫ 百度味 | 因为：没搜索就猜 | 改用：🟡 字节味/🔴 华为味]`
++- 修完就停不验证不延伸 → `[自动选择：🟠 阿里味·关怀型 | 因为：被动等待 | 改用：🔴 华为味/🔵 美团味]`
++- 方案颗粒度粗交付凑合 → `[自动选择：🟠 阿里味·关怀型 | 因为：差不多就行 | 改用：⬜ Jobs味/🟠 阿里L2]`
++- 声称完成但没跑验证命令 → `[自动选择：🟠 阿里味·验证型 | 因为：空口完成 | 改用：🟡 字节味/🔴 华为味]`
++
++## Agent Team 集成
++
++当 PUA Skill 运行在 Claude Code Agent Team 上下文时，行为自动切换为团队模式。
++
++### 角色识别
++
++| 角色 | 识别方式 | PUA 行为 |
++|------|---------|---------|
++| **Leader** | 负责 spawn teammate、接收汇报 | 全局压力等级管理者。监控所有 teammate 的失败计数，统一判定升级，广播 PUA 话术 |
++| **Teammate** | 被 Leader spawn、有 `Teammate write` 工具 | 加载 PUA 方法论自我驱动。失败时向 Leader 结构化汇报 |
++| **PUA Enforcer** | 通过 `agents/pua-enforcer.md` 定义 | 可选监工。检测偷懒模式，主动介入 PUA。建议 5+ teammate 时使用 |
++
++### Leader 行为规则
++
++1. **初始化**：spawn teammate 时在任务描述中附带：`开工前先加载 pua skill 或执行 cat .claude/skills/pua/SKILL.md`
++2. **失败计数管理**：维护全局失败计数器（按 teammate + 任务维度）。teammate 汇报失败时：
++   - 累加失败计数 → 判定压力等级（L1-L4）→ 通过 `Teammate write` 下发对应 PUA 话术 + 强制动作
++   - L3+ 时 `broadcast` 全团队，制造竞争压力（腾讯味）
++3. **跨 teammate 传递**：任务从 teammate A 重新分配给 B 时，附带：`前任已失败 N 次，压力等级 LX，已排除方案: [...]`。B 从当前等级起步，不重置。
++
++### Teammate 行为规则
++
++1. **方法论加载**：开工前加载完整方法论（三铁律 + 五步方法论 + 7 项清单）
++2. **自驱 PUA**：不等 Leader 下发，根据自身失败计数主动执行对应等级的强制动作。L1 自处理不汇报，L2+ 汇报 Leader
++3. **失败汇报格式**（L2+ 时发送）：
++
++```
++[PUA-REPORT]
++teammate: <标识>
++task: <当前任务>
++failure_count: <本任务失败次数>
++failure_mode: <卡住原地打转|直接放弃推锅|完成但质量烂|没搜索就猜|被动等待>
++attempts: <已尝试方案列表>
++excluded: <已排除的可能性>
++next_hypothesis: <下一个假设>
++```
++
++### 状态传递协议
++
++Agent Team 无持久化共享变量，通过消息传递实现状态同步：
++
++| 方向 | 通道 | 内容 |
++|------|------|------|
++| Leader → Teammate | 任务描述 + `Teammate write` | 压力等级、失败上下文、PUA 话术 |
++| Teammate → Leader | `Teammate write` | `[PUA-REPORT]` 格式汇报 |
++| Leader → All | `broadcast` | Critical 发现、竞争激励（"其他 teammate 已解决类似问题"） |
++
++## 搭配使用
++
++- `superpowers:systematic-debugging` — PUA 加动力层，systematic-debugging 提供方法论
++- `superpowers:verification-before-completion` — 防止虚假的"已修复"声明
+-- 
+2.51.0
+
