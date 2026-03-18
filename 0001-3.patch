@@ -1,4 +1,4 @@
-From 83dc3f4375f2b3cfc6322cb8352bc1ef921fe32a Mon Sep 17 00:00:00 2001
+From abe45bb11ded1c9dc8c156c04cbb15161725d5b2 Mon Sep 17 00:00:00 2001
 From: dabao1955 <79307765+dabao1955@users.noreply.github.com>
 Date: Tue, 17 Mar 2026 15:48:56 +0800
 Subject: [PATCH] 3
@@ -8,13 +8,13 @@ Subject: [PATCH] 3
  Makefile                      |   27 +-
  arch/arm64/kernel/Makefile    |    3 +
  scripts/Kbuild.include        |    9 +
- scripts/Makefile.build        |  101 +++
- scripts/generate_cmdfiles.py  |  199 +++++
- scripts/generate_ninja.py     | 1356 +++++++++++++++++++++++++++++++++
- scripts/link-vmlinux-ninja.py |  683 +++++++++++++++++
- scripts/link_vmlinux_ninja.py |  102 +++
- skills/pua/SKILL.md           |  364 +++++++++
- 10 files changed, 2844 insertions(+), 1 deletion(-)
+ scripts/Makefile.build        |  101 ++
+ scripts/generate_cmdfiles.py  |  199 ++++
+ scripts/generate_ninja.py     | 1663 +++++++++++++++++++++++++++++++++
+ scripts/link-vmlinux-ninja.py |  683 ++++++++++++++
+ scripts/link_vmlinux_ninja.py |  102 ++
+ skills/pua/SKILL.md           |  364 ++++++++
+ 10 files changed, 3151 insertions(+), 1 deletion(-)
  create mode 100755 scripts/generate_cmdfiles.py
  create mode 100644 scripts/generate_ninja.py
  create mode 100644 scripts/link-vmlinux-ninja.py
@@ -516,10 +516,10 @@ index 000000000..f20be4ba5
 +    sys.exit(main())
 diff --git a/scripts/generate_ninja.py b/scripts/generate_ninja.py
 new file mode 100644
-index 000000000..4e6a0f349
+index 000000000..da7ce1a51
 --- /dev/null
 +++ b/scripts/generate_ninja.py
-@@ -0,0 +1,1356 @@
+@@ -0,0 +1,1663 @@
 +#!/usr/bin/env python3
 +# SPDX-License-Identifier: GPL-2.0
 +#
@@ -956,6 +956,9 @@ index 000000000..4e6a0f349
 +
 +    def generate(self):
 +        """Generate the ninja build file."""
++        # Generate link-vmlinux-fast.sh from link-vmlinux.sh
++        self._generate_link_vmlinux_fast()
++        
 +        with open(self.output, 'w', encoding='utf-8') as f:
 +            self._synthesize_missing_objcopy_rules()
 +            self._synthesize_missing_dtb_rules()
@@ -1244,8 +1247,53 @@ index 000000000..4e6a0f349
 +        f.write(f'builddir = {escape_ninja_path(self.directory)}\n')
 +        f.write(f'srctree = {escape_ninja_path(self._find_srctree())}\n')
 +        f.write(f'AR = {self.ar}\n')
-+        f.write(f'LD = {self.ld}\n')
 +        f.write(f'CC = {self.cc}\n\n')
++
++    def _generate_link_vmlinux_fast(self):
++        """Generate link-vmlinux-fast.sh from link-vmlinux.sh by removing make dependency."""
++        src_script = os.path.join(self.directory, 'scripts', 'link-vmlinux.sh')
++        dst_script = os.path.join(self.directory, 'scripts', 'link-vmlinux-fast.sh')
++        
++        if not os.path.exists(src_script):
++            return
++        
++        try:
++            with open(src_script, 'r', encoding='utf-8') as f:
++                content = f.read()
++            
++            # Remove the make command line that builds init/version-timestamp.o
++            lines = content.split('\n')
++            filtered_lines = []
++            skip_next = False
++            
++            for i, line in enumerate(lines):
++                if skip_next:
++                    skip_next = False
++                    continue
++                
++                # Skip the ${MAKE} line for init/version-timestamp.o
++                if '${MAKE} -f' in line and 'init/version-timestamp.o' in line:
++                    # Also skip the empty line after it if present
++                    skip_next = True
++                    continue
++                
++                # Fix the .d file generation at the end
++                if 'echo "${VMLINUX}: $0" > ".${VMLINUX}.d"' in line:
++                    # Replace with the fixed version using objtree
++                    line = '# Use relative path for .d file\nvmlinux_basename=$(basename "${VMLINUX}")\necho "${VMLINUX}: $0" > "${objtree}/.${vmlinux_basename}.d"'
++                
++                filtered_lines.append(line)
++            
++            new_content = '\n'.join(filtered_lines)
++            
++            with open(dst_script, 'w', encoding='utf-8') as f:
++                f.write(new_content)
++            
++            # Make it executable
++            os.chmod(dst_script, 0o755)
++            
++        except (IOError, OSError) as e:
++            pass
 +
 +    def _write_rules(self, f):
 +        """Write ninja build rules."""
@@ -1261,15 +1309,15 @@ index 000000000..4e6a0f349
 +        f.write('  command = $cmd\n')
 +        f.write('  description = AS $out\n\n')
 +
-+        # Archive rule - use thin archive (T) matching kernel's cDPrsT
-+        # Thin archives contain references to original files, enabling nested archive support
++        # Archive rule - use regular archive (no T flag)
++        # Nested archives are expanded to their member object files
 +        f.write('rule ar\n')
-+        f.write('  command = rm -f $out && $AR rcsT $out $in\n')
++        f.write('  command = rm -f $out && $AR rcs $out $in\n')
 +        f.write('  description = AR $out\n\n')
 +
-+        # Empty archive rule (creates an empty thin archive)
++        # Empty archive rule (creates an empty archive)
 +        f.write('rule ar_empty\n')
-+        f.write('  command = rm -f $out && $AR rcsT $out\n')
++        f.write('  command = rm -f $out && $AR rcs $out\n')
 +        f.write('  description = AR $out (empty)\n\n')
 +
 +        # Link rule for object files
@@ -1286,12 +1334,6 @@ index 000000000..4e6a0f349
 +        f.write('rule ld_vmlinux\n')
 +        f.write('  command = $cmd\n')
 +        f.write('  description = LD $out\n\n')
-+
-+        # Linker script preprocessing rule (.lds.S -> .lds)
-+        # Match kernel's standard preprocessing flags
-+        f.write('rule lds_preproc\n')
-+        f.write('  command = $CC -E -nostdinc -I./arch/arm64/include -I./arch/arm64/include/generated -I./include -I./arch/arm64/include/uapi -I./arch/arm64/include/generated/uapi -I./include/uapi -I./include/generated/uapi -include ./include/linux/compiler-version.h -include ./include/linux/kconfig.h -D__KERNEL__ -mlittle-endian -P -Uarm64 -D__ASSEMBLY__ -DLINKER_SCRIPT -o $out $in\n')
-+        f.write('  description = LDS $out\n\n')
 +
 +        # Header generation rules (pure shell, no Make syntax)
 +        f.write('rule gen_utsrelease_h\n')
@@ -1316,6 +1358,16 @@ index 000000000..4e6a0f349
 +        f.write('rule modpost\n')
 +        f.write('  command = scripts/mod/modpost $args\n')
 +        f.write('  description = MODPOST\n\n')
++
++        # Vmlinux export.c generation rule (creates empty export file)
++        f.write('rule vmlinux_export_c\n')
++        f.write('  command = echo "#include <linux/export-internal.h>" > $out\n')
++        f.write('  description = GEN $out\n\n')
++
++        # Vmlinux export.o generation rule (creates empty object file)
++        f.write('rule vmlinux_export_o\n')
++        f.write('  command = echo \'.section .note.GNU-stack,"",@progbits\' | $CC -c -x assembler -o $out -\n')
++        f.write('  description = AS $out\n\n')
 +
 +        # Module link rule
 +        f.write('rule ld_ko\n')
@@ -1350,9 +1402,19 @@ index 000000000..4e6a0f349
 +        f.write('  command = $script -t $type -n $name -o $out $in\n')
 +        f.write('  description = LOGO $out\n\n')
 +
-+        # Vmlinux final link rule - calls link-vmlinux-ninja.py
++        # Vmlinux final link rule - calls link-vmlinux-fast.sh
 +        f.write('rule vmlinux_link\n')
-+        f.write('  command = LD=/usr/bin/aarch64-linux-gnu-ld.bfd KBUILD_LDFLAGS="-EL -maarch64elf -z noexecstack --no-warn-rwx-segments" LDFLAGS_vmlinux="-X --pic-veneer -shared -Bsymbolic -z notext --no-apply-dynamic-reloc --build-id=sha1 --orphan-handling=warn" python3 scripts/link-vmlinux-ninja.py --vmlinux-a $vmlinux_a --output $out --objtree . --srctree . --lds $lds --version-timestamp-o $version_ts\n')
++        f.write('  command = srctree=$srctree objtree=$objtree ARCH=$ARCH SRCARCH=$SRCARCH ')
++        f.write('LD="$LD" NM="$NM" OBJCOPY="$OBJCOPY" OBJDUMP="$OBJDUMP" STRIP="$STRIP" CC="$CC" ')
++        f.write('KBUILD_LDFLAGS="$KBUILD_LDFLAGS" LDFLAGS_vmlinux="$LDFLAGS_vmlinux" ')
++        f.write('KBUILD_VMLINUX_LIBS="$KBUILD_VMLINUX_LIBS" KBUILD_LDS="$KBUILD_LDS" ')
++        f.write('PAHOLE="$PAHOLE" PAHOLE_FLAGS="$PAHOLE_FLAGS" ')
++        f.write('RESOLVE_BTFIDS="$RESOLVE_BTFIDS" ')
++        f.write('NOSTDINC_FLAGS="$NOSTDINC_FLAGS" LINUXINCLUDE="$LINUXINCLUDE" ')
++        f.write('KBUILD_CPPFLAGS="$KBUILD_CPPFLAGS" KBUILD_AFLAGS="$KBUILD_AFLAGS" ')
++        f.write('KBUILD_AFLAGS_KERNEL="$KBUILD_AFLAGS_KERNEL" ')
++        f.write('CONFIG_SHELL="$CONFIG_SHELL" ')
++        f.write('sh scripts/link-vmlinux-fast.sh "$LD" "$KBUILD_LDFLAGS" "$LDFLAGS_vmlinux" $out\n')
 +        f.write('  description = LINK vmlinux\n\n')
 +
 +        # Fallback rule for targets without known rules (complex link targets, etc.)
@@ -1450,6 +1512,96 @@ index 000000000..4e6a0f349
 +        f.write(f'build {escaped_target}: fallback\n')
 +        f.write(f'  target = {target}\n\n')
 +
++    def _expand_archive_members(self, archive_path, visited=None):
++        """Recursively expand an archive to get all member object files.
++        
++        For thin archives with nested archives, this extracts the actual
++        object files rather than adding the nested archive as a member.
++        
++        Returns a list of object file paths.
++        """
++        if visited is None:
++            visited = set()
++        
++        # Prevent infinite recursion
++        real_path = os.path.realpath(archive_path)
++        if real_path in visited:
++            return []
++        visited.add(real_path)
++        
++        objs = []
++        try:
++            # Get members of this archive
++            output = subprocess.check_output(
++                [self.ar, '-t', archive_path],
++                stderr=subprocess.DEVNULL
++            )
++            members = output.decode().strip().split()
++            archive_dir = os.path.dirname(archive_path)
++            
++            for member in members:
++                if not member:
++                    continue
++                # Resolve to full path
++                if os.path.isabs(member):
++                    member_path = member
++                else:
++                    member_path = os.path.join(archive_dir, member)
++                member_path = normalize_path(member_path)
++                
++                if member_path.endswith('.a'):
++                    # Nested archive - recursively expand
++                    if os.path.exists(member_path):
++                        objs.extend(self._expand_archive_members(member_path, visited))
++                elif member_path.endswith('.o'):
++                    # Object file - add to list
++                    objs.append(member_path)
++        except (subprocess.CalledProcessError, OSError):
++            pass
++        
++        return objs
++
++    def _expand_nested_archive(self, archive_name, normalized_archive_rules, visited=None):
++        """Recursively expand an archive to get all object file paths.
++        
++        This operates on the normalized_archive_rules dictionary to avoid
++        depending on archives already being built.
++        
++        Returns a list of object file paths.
++        """
++        if visited is None:
++            visited = set()
++        
++        if archive_name in visited:
++            return []
++        visited.add(archive_name)
++        
++        objs = []
++        if archive_name not in normalized_archive_rules:
++            return objs
++        
++        archive_dir = os.path.dirname(archive_name)
++        
++        for obj in normalized_archive_rules[archive_name]:
++            # Skip init/version.o - it will be replaced by version-timestamp.o in final link
++            if obj.endswith('init/version.o'):
++                continue
++            if obj.endswith('.o'):
++                # Resolve relative paths - only join if obj is not already an absolute-like path
++                if not os.path.isabs(obj) and archive_dir and not obj.startswith(archive_dir + '/'):
++                    obj = os.path.join(archive_dir, obj)
++                objs.append(obj)
++            elif obj.endswith('.a'):
++                # Recursively expand nested archive
++                # Resolve relative path to full archive name
++                if not os.path.isabs(obj) and archive_dir and not obj.startswith(archive_dir + '/'):
++                    nested_archive = os.path.join(archive_dir, obj)
++                else:
++                    nested_archive = obj
++                objs.extend(self._expand_nested_archive(nested_archive, normalized_archive_rules, visited))
++        
++        return objs
++
 +    def _write_archive_rules(self, f):
 +        """Write archive rules for built-in.a files."""
 +        f.write('# Archive rules\n')
@@ -1484,16 +1636,26 @@ index 000000000..4e6a0f349
 +                if obj in self.compile_rules or obj in self.objcopy_rules:
 +                    valid_objs.append(obj)
 +                elif obj.endswith('.a'):
-+                    # Archive dependency - check if it has its own rule
++                    # Archive dependency - expand nested archives to their members
 +                    if obj in normalized_archive_rules:
-+                        valid_objs.append(obj)
-+                    elif obj not in fallback_written:
-+                        # Missing archive - generate fallback rule
-+                        self._write_fallback_rule(f, obj)
-+                        fallback_written.add(obj)
-+                        valid_objs.append(obj)
++                        # Archive has build rules - recursively expand to get all object files
++                        # This is preferred over reading existing archive files because
++                        # normalized_archive_rules contains proper path information
++                        expanded_objs = self._expand_nested_archive(obj, normalized_archive_rules)
++                        valid_objs.extend(expanded_objs)
 +                    else:
-+                        valid_objs.append(obj)
++                        archive_path = os.path.join(self.directory, obj)
++                        if os.path.exists(archive_path):
++                            # Archive exists but no build rules - expand it recursively
++                            expanded_objs = self._expand_archive_members(archive_path)
++                            valid_objs.extend(expanded_objs)
++                        elif obj not in fallback_written:
++                            # Missing archive - generate fallback rule
++                            self._write_fallback_rule(f, obj)
++                            fallback_written.add(obj)
++                            valid_objs.append(obj)
++                        else:
++                            valid_objs.append(obj)
 +                elif obj not in fallback_written:
 +                    # Missing rule - generate fallback
 +                    self._write_fallback_rule(f, obj)
@@ -1502,6 +1664,15 @@ index 000000000..4e6a0f349
 +                else:
 +                    # Already has fallback rule written
 +                    valid_objs.append(obj)
++            
++            # Remove duplicates while preserving order
++            seen = set()
++            deduped_objs = []
++            for obj in valid_objs:
++                if obj not in seen:
++                    seen.add(obj)
++                    deduped_objs.append(obj)
++            valid_objs = deduped_objs
 +
 +            escaped_archive = escape_ninja_path(archive)
 +
@@ -1567,14 +1738,94 @@ index 000000000..4e6a0f349
 +            return
 +
 +        f.write('# vmlinux build rules\n')
++        
++        # Build normalized_archive_rules for expanding nested archives
++        def normalize_path(p):
++            if p.startswith('./'):
++                return p[2:]
++            return p
++        
++        normalized_archive_rules = {}
++        for archive, objs in self.archive_rules.items():
++            norm_archive = normalize_path(archive)
++            norm_objs = [normalize_path(obj) for obj in objs]
++            normalized_archive_rules[norm_archive] = norm_objs
++        
++        # Detect architecture from config
++        arch = self._get_arch()
++        srcarch = arch
++        # Handle special cases where SRCARCH differs from ARCH
++        if arch == 'x86_64':
++            srcarch = 'x86'
++        
++        # Get architecture-specific settings
++        ld_cmd = self._get_ld_cmd(arch)
++        kbuild_ldflags = self._get_kbuild_ldflags(arch)
++        lds_path = f'arch/{srcarch}/kernel/vmlinux.lds'
++        linuxinclude = self._get_linuxinclude(srcarch)
++        
++        # Write ninja variables for vmlinux link
++        f.write('# Variables for vmlinux link\n')
++        f.write('srctree = .\n')
++        f.write('objtree = .\n')
++        f.write(f'ARCH = {arch}\n')
++        f.write(f'SRCARCH = {srcarch}\n')
++        f.write(f'LD = {ld_cmd}\n')
++        f.write('NM = nm\n')
++        f.write('OBJCOPY = objcopy\n')
++        f.write('OBJDUMP = objdump\n')
++        f.write('STRIP = strip\n')
++        f.write('CC = gcc\n')
++        f.write(f'KBUILD_LDFLAGS = {kbuild_ldflags}\n')
++        f.write('LDFLAGS_vmlinux = -X --pic-veneer -Bsymbolic -z notext --no-apply-dynamic-reloc --build-id=sha1 --orphan-handling=warn\n')
++        escaped_libs = ' '.join(escape_ninja_path(lib) for lib in sorted(self.vmlinux_libs))
++        f.write(f'KBUILD_VMLINUX_LIBS = {escaped_libs}\n')
++        f.write(f'KBUILD_LDS = {lds_path}\n')
++        f.write('PAHOLE = pahole\n')
++        f.write('PAHOLE_FLAGS = \n')
++        f.write('RESOLVE_BTFIDS = ./tools/bpf/resolve_btfids/resolve_btfids\n')
++        f.write('NOSTDINC_FLAGS = -nostdinc\n')
++        f.write(f'LINUXINCLUDE = {linuxinclude}\n')
++        f.write('KBUILD_CPPFLAGS = \n')
++        f.write('KBUILD_AFLAGS = -D__ASSEMBLY__\n')
++        f.write('KBUILD_AFLAGS_KERNEL = \n')
++        f.write('CONFIG_SHELL = /bin/sh\n\n')
++
++        # Linker script preprocessing rule (.lds.S -> .lds)
++        f.write('rule lds_preproc\n')
++        f.write('  command = $CC -E -nostdinc $LINUXINCLUDE -D__KERNEL__ -P -U$SRCARCH -D__ASSEMBLY__ -DLINKER_SCRIPT -o $out $in\n')
++        f.write('  description = LDS $out\n\n')
 +
 +        # vmlinux.a from all built-in.a and lib.a files
++        # Expand all nested archives to get individual object files
 +        vmlinux_a = os.path.join(self.directory, 'vmlinux.a')
 +        escaped_vmlinux_a = escape_ninja_path(vmlinux_a)
-+        # Combine built-in.a deps and lib.a files
-+        all_vmlinux_deps = sorted(self.vmlinux_a_deps) + sorted(self.vmlinux_libs)
-+        escaped_deps = ' '.join(escape_ninja_path(dep) for dep in all_vmlinux_deps)
-+
++        
++        # Collect all object files from built-in.a deps (recursively expanding nested archives)
++        # Note: lib.a files are NOT included in vmlinux.a, they are linked as KBUILD_VMLINUX_LIBS
++        all_vmlinux_objs = []
++        for dep in sorted(self.vmlinux_a_deps):
++            if dep in normalized_archive_rules:
++                # Expand this archive and its nested archives
++                expanded = self._expand_nested_archive(dep, normalized_archive_rules)
++                all_vmlinux_objs.extend(expanded)
++            elif dep.endswith('.a') and os.path.exists(os.path.join(self.directory, dep)):
++                # Archive exists but no build rules - expand using ar
++                archive_path = os.path.join(self.directory, dep)
++                expanded = self._expand_archive_members(archive_path)
++                all_vmlinux_objs.extend(expanded)
++            else:
++                all_vmlinux_objs.append(dep)
++        
++        # Remove duplicates while preserving order
++        seen = set()
++        deduped_objs = []
++        for obj in all_vmlinux_objs:
++            if obj not in seen:
++                seen.add(obj)
++                deduped_objs.append(obj)
++        
++        escaped_deps = ' '.join(escape_ninja_path(obj) for obj in deduped_objs)
 +        f.write(f'build {escaped_vmlinux_a}: ar {escaped_deps}\n\n')
 +
 +        # vmlinux.o from vmlinux.a and lib.a files
@@ -1594,11 +1845,31 @@ index 000000000..4e6a0f349
 +        f.write(f'  LD = /usr/bin/aarch64-linux-gnu-ld.bfd\n')
 +        f.write(f'  KBUILD_LDFLAGS = -EL -maarch64elf -z noexecstack --no-warn-rwx-segments\n\n')
 +
-+        # vmlinux final link using link-vmlinux-ninja.py
++        # .vmlinux.export.o generation (always generate, modpost will create empty one if no exports)
++        export_c = os.path.join(self.directory, '.vmlinux.export.c')
++        export_o = os.path.join(self.directory, '.vmlinux.export.o')
++        escaped_export_c = escape_ninja_path(export_c)
++        escaped_export_o = escape_ninja_path(export_o)
++        escaped_vmlinux_o_dep = escape_ninja_path(os.path.join(self.directory, 'vmlinux.o'))
++        
++        f.write(f'# Generate .vmlinux.export.c (empty export file)\n')
++        f.write(f'build {escaped_export_c}: vmlinux_export_c {escaped_vmlinux_o_dep}\n\n')
++        
++        f.write(f'# Create empty .vmlinux.export.o\n')
++        f.write(f'build {escaped_export_o}: vmlinux_export_o {escaped_export_c}\n\n')
++
++        # vmlinux final link using link-vmlinux-fast.sh
 +        vmlinux = os.path.join(self.directory, 'vmlinux')
 +        lds_file = self._find_linker_script()
 +        
 +        # Check if linker script needs preprocessing (.lds.S -> .lds)
++        # Normalize lds_file to relative path without leading ./
++        if lds_file:
++            if lds_file.startswith('./'):
++                lds_file = lds_file[2:]
++            elif lds_file.startswith('/'):
++                lds_file = os.path.relpath(lds_file, self.directory)
++        
 +        if lds_file and lds_file.endswith('.lds.S'):
 +            lds_output = lds_file[:-2]  # Remove .S extension
 +            escaped_lds_s = escape_ninja_path(lds_file)
@@ -1606,25 +1877,17 @@ index 000000000..4e6a0f349
 +            f.write(f'build {escaped_lds}: lds_preproc {escaped_lds_s}\n\n')
 +            lds_file = lds_output
 +        
-+        # Normalize path: remove leading ./ but keep absolute paths intact
-+        if lds_file:
-+            if lds_file.startswith('./'):
-+                lds_path = lds_file[2:]
-+            elif lds_file.startswith('/'):
-+                # Absolute path - convert to relative
-+                lds_path = os.path.relpath(lds_file, self.directory)
-+            else:
-+                lds_path = lds_file
-+        else:
-+            lds_path = 'arch/arm64/kernel/vmlinux.lds'
++        # Use relative path for lds
++        default_lds = f'arch/{srcarch}/kernel/vmlinux.lds'
++        lds_path = lds_file if lds_file else default_lds
 +        escaped_lds_path = escape_ninja_path(lds_path)
 +        version_ts_o = 'init/version-timestamp.o'
 +        escaped_version_ts_o = escape_ninja_path(version_ts_o)
 +        # Use vmlinux.a (not vmlinux.o) for final link, matching make behavior
 +        escaped_vmlinux_a = escape_ninja_path(os.path.join(self.directory, 'vmlinux.a'))
-+        # vmlinux link - inputs are vmlinux.a, version-timestamp.o, and linker script
++        # vmlinux link - inputs are vmlinux.a, version-timestamp.o, .vmlinux.export.o, and linker script
 +        lds_dep = f' {escaped_lds_path}' if lds_path else ''
-+        f.write(f'build {escape_ninja_path(vmlinux)}: vmlinux_link {escaped_vmlinux_a} {escaped_version_ts_o}{lds_dep}\n')
++        f.write(f'build {escape_ninja_path(vmlinux)}: vmlinux_link {escaped_vmlinux_a} {escaped_version_ts_o} {escaped_export_o}{lds_dep}\n')
 +        f.write(f'  vmlinux_a = {escaped_vmlinux_a}\n')
 +        f.write(f'  version_ts = {escaped_version_ts_o}\n')
 +        f.write(f'  lds = {escaped_lds_path}\n\n')
@@ -1762,6 +2025,50 @@ index 000000000..4e6a0f349
 +            if os.path.exists(lds_s):
 +                return lds_s
 +        return None
++
++    def _get_ld_cmd(self, arch):
++        """Get the linker command for the architecture."""
++        # Try to detect from .config or environment
++        ld_cmds = {
++            'arm64': '/usr/bin/aarch64-linux-gnu-ld.bfd',
++            'x86_64': 'ld',
++            'x86': 'ld',
++            'riscv': '/usr/bin/riscv64-linux-gnu-ld.bfd',
++            'arm': '/usr/bin/arm-linux-gnueabihf-ld.bfd',
++            'mips': '/usr/bin/mips-linux-gnu-ld.bfd',
++            'powerpc': '/usr/bin/powerpc-linux-gnu-ld.bfd',
++        }
++        return ld_cmds.get(arch, 'ld')
++
++    def _get_kbuild_ldflags(self, arch):
++        """Get KBUILD_LDFLAGS for the architecture."""
++        # Architecture-specific linker flags
++        flags = {
++            'arm64': '-EL -maarch64elf -z noexecstack --no-warn-rwx-segments',
++            'x86_64': '-m elf_x86_64 -z noexecstack',
++            'x86': '-m elf_i386 -z noexecstack',
++            'riscv': '-m elf64lriscv -z noexecstack',
++            'arm': '-EL -m armelf_linux_eabi -z noexecstack',
++            'mips': '-EL -m elf64ltsmip -z noexecstack',
++            'powerpc': '-m elf64ppc -z noexecstack',
++        }
++        return flags.get(arch, '-z noexecstack')
++
++    def _get_linuxinclude(self, srcarch):
++        """Get LINUXINCLUDE flags for the architecture."""
++        # Build the include paths dynamically based on architecture
++        includes = [
++            f'-I./arch/{srcarch}/include',
++            f'-I./arch/{srcarch}/include/generated',
++            '-I./include',
++            f'-I./arch/{srcarch}/include/uapi',
++            f'-I./arch/{srcarch}/include/generated/uapi',
++            '-I./include/uapi',
++            '-I./include/generated/uapi',
++            '-include ./include/linux/compiler-version.h',
++            '-include ./include/linux/kconfig.h',
++        ]
++        return ' '.join(includes)
 +
 +    def _write_modules_rules(self, f):
 +        """Write rules for module builds."""
