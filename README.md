@@ -1,5 +1,7 @@
 # Linux Kernel Ninja Build Integration
 
+Please note, the integration is in a very early stage and not usable yet for using production environment..
+
 This project enables the Linux kernel to use the [Ninja build system](https://ninja-build.org/) for faster incremental builds. It generates `build.ninja` files from kernel build artifacts without requiring a full compilation first.
 
 ## Overview
